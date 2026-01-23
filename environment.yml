@@ -1,0 +1,33 @@
+name: fastllm
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch=2.5.1
+  - pytorch-cuda=12.1
+  - torchvision
+  - torchaudio
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - seaborn
+
+  - pip:
+      # 只保留「纯 Python / 上层库」
+      # 删掉：torch / nvidia-* / numpy / flash-attn
+      - accelerate==0.34.2
+      - transformers==4.49.0
+      - datasets==4.2.0
+      - einops==0.8.1
+      - peft==0.17.1
+      - triton==3.1.0
+      - jupyterlab==4.4.9
+      - ipykernel
+      - gradio==5.49.1
+      - lm-eval==0.4.8
+      # 其余你项目需要的再慢慢加

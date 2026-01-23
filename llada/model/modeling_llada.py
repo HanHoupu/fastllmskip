@@ -433,7 +433,11 @@ class RotaryEmbedding(nn.Module):
         return ((t * pos_cos) + (self.rotate_half(t) * pos_sin)).to(t.dtype)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor,
-                block_end_index: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                block_end_index: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        position_ids: 可选，形状 (query_len,)，指定每个 query token 的绝对位置（支持不连续）
+        """
         if self.config.rope_full_precision:
             q_, k_ = q.float(), k.float()
         else:
@@ -445,17 +449,13 @@ class RotaryEmbedding(nn.Module):
             pos_sin = pos_sin.type_as(q_)
             pos_cos = pos_cos.type_as(q_)
 
-            # Build tensor indices instead of using .item()
-            if block_end_index is None:
-                start = key_len - query_len
-                end = key_len
+            # 支持不连续位置：如果传了 position_ids，直接用；否则按原逻辑生成连续位置
+            if position_ids is not None:
+                idx = position_ids
+            elif block_end_index is None:
+                idx = torch.arange(key_len - query_len, key_len, device=q_.device, dtype=torch.long)
             else:
-                # block_end_index is a tensor; keep ops tensor-based
-                start = (block_end_index - query_len)
-                end = block_end_index
-
-            # Make an index tensor [start, ..., end-1] on the right device/dtype
-            idx = torch.arange(start, end, device=q_.device, dtype=torch.long)
+                idx = torch.arange(block_end_index - query_len, block_end_index, device=q_.device, dtype=torch.long)
 
             # Use index_select on the sequence dimension (dim=2)
             pos_sin_slice = pos_sin.index_select(2, idx)
@@ -709,6 +709,7 @@ class LLaDABlock(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         replace_position: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,  # 新增：支持不连续位置
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
@@ -756,7 +757,10 @@ class LLaDABlock(nn.Module):
 
         if self.config.rope:
             # Apply rotary embeddings.
-            if replace_position is None:
+            if position_ids is not None:
+                # 使用传入的位置（支持不连续）
+                q, k = self.rotary_emb(q, k, position_ids=position_ids)
+            elif replace_position is None:
                 q, k = self.rotary_emb(q, k)
             else:
                 # For batched replace_position, use the maximum position across all batches
@@ -957,28 +961,20 @@ class LLaDALlamaBlock(LLaDABlock):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         replace_position: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,  # 新增：支持不连续位置
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
-        # shape:
-        #  - for regular attn q, k, v: (batch_size, seq_len, d_model)
-        #  - for multi-query attn q: (batch_size, seq_len, d_model)
-        #                      k, v: (batch_size, seq_len, d_model // n_heads)
-        #  - for group query attn q: (batch_size, seq_len, d_model)
-        #                      k, v: (batch_size, seq_len, d_model // n_kv_heads)
-        x_normed = self.attn_norm(x) #x:torch.Size([2, 168, 4096])
-        q = self.q_proj(x_normed) #q:torch.Size([2, 168, 4096])
-        k = self.k_proj(x_normed) #k:torch.Size([2, 168, 4096])
-        v = self.v_proj(x_normed) #v:torch.Size([2, 168, 4096])
-        # attention_bias: None
-        # layer_past: None
-        # use_cache: False
+        x_normed = self.attn_norm(x)
+        q = self.q_proj(x_normed)
+        k = self.k_proj(x_normed)
+        v = self.v_proj(x_normed)
         # Get attention scores.
         if self._activation_checkpoint_fn is not None:
-            att, cache = self._activation_checkpoint_fn(  # type: ignore
-                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position
+            att, cache = self._activation_checkpoint_fn(
+                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position)
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -1347,6 +1343,12 @@ class LLaDAModel(nn.Module):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,  # 支持不连续位置
+        # Token Skip 参数
+        skip_layer_k: int = None,       # 判定用的前 K 层
+        skip_threshold: float = 0.95,   # 平均 cos sim 阈值
+        skip_outlier: float = 0.6,      # 偏离阈值
+        prev_hidden: Optional[List[torch.Tensor]] = None,  # 上一 step 的 hidden states
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1461,12 +1463,22 @@ class LLaDAModel(nn.Module):
 
         # decoder layers
         all_hidden_states = []
+        
+        # Token Skip 相关
+        skip_enabled = skip_layer_k is not None and prev_hidden is not None
+        active_indices = None
+        orig_seq_len = x.shape[1]
+        x_full = None  # 保存完整的 x，用于合并
 
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
-            for block_idx, block in enumerate(self.transformer.blocks):
+            num_layers = len(self.transformer.blocks)
+            split_layer = skip_layer_k if skip_enabled else num_layers
+            
+            # ===== Loop 1: 前 K 层（所有 token）=====
+            for block_idx in range(min(split_layer, num_layers)):
+                block = self.transformer.blocks[block_idx]
                 if output_hidden_states:
-                    # add hidden states
                     all_hidden_states.append(x)
 
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
@@ -1485,16 +1497,103 @@ class LLaDAModel(nn.Module):
                         and block_idx % 4 == 0
                     )
                 ):
-                    # shape: (batch_size, seq_len, d_model)
                     x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position
+                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids
                     )
                 else:
-                    # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position)
+                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
+            
+            # ===== 判定：哪些 token 稳定 =====
+            if skip_enabled and split_layer < num_layers:
+                L = x.shape[1]
+                active_mask = torch.ones(L, dtype=torch.bool, device=x.device)
+                for j in range(L):
+                    cos_sims = []
+                    for layer in range(1, min(skip_layer_k, len(all_hidden_states))):
+                        h1 = prev_hidden[layer][0, j, :]
+                        h2 = all_hidden_states[layer][0, j, :]
+                        cos = F.cosine_similarity(h1.unsqueeze(0), h2.unsqueeze(0), dim=-1).item()
+                        cos = min(1.0, cos)  # clamp: bfloat16 精度问题可能导致 >1
+                        cos_sims.append(cos)
+                    if len(cos_sims) > 0 and min(cos_sims) >= skip_outlier and sum(cos_sims) / len(cos_sims) > skip_threshold:
+                        active_mask[j] = False  # 稳定，踢出
+                
+                # 只取不稳定的 token
+                if not active_mask.all() and active_mask.any():
+                    # 有稳定的，也有不稳定的
+                    active_indices = active_mask.nonzero(as_tuple=True)[0]
+                    x_full = x.clone()
+                    x = x[:, active_indices, :].clone()  # 确保独立内存
+                    position_ids = active_indices  # 更新位置
+                    # 更新 replace_position：只标记 active 的位置
+                    if replace_position is not None:
+                        new_replace = torch.zeros_like(replace_position)
+                        active_global = replace_position.nonzero(as_tuple=True)[1][active_indices]
+                        new_replace[:, active_global] = True
+                        replace_position = new_replace
+                elif not active_mask.any():
+                    # 全部稳定，直接跳过 Loop 2
+                    x_full = x.clone()  # 确保独立内存
+                    active_indices = torch.tensor([], dtype=torch.long, device=x.device)
+            
+            # ===== Loop 2: 后面的层（只跑不稳定的 token）=====
+            # 如果所有 token 都稳定，跳过 Loop 2
+            skip_loop2 = active_indices is not None and len(active_indices) == 0
+            
+            for block_idx in range(split_layer, num_layers):
+                block = self.transformer.blocks[block_idx]
+                if output_hidden_states:
+                    # 如果有 token 被 skip，需要合并成完整形状再 append
+                    if active_indices is not None and len(active_indices) > 0:
+                        x_for_record = x_full.clone()
+                        x_for_record[:, active_indices, :] = x
+                        all_hidden_states.append(x_for_record)
+                    elif x_full is not None:
+                        all_hidden_states.append(x_full)
+                    else:
+                        all_hidden_states.append(x)
+                
+                if skip_loop2:
+                    # 全部稳定，只记录 hidden states，不计算
+                    if attn_key_values is not None:
+                        attn_key_values.append(past_key_values[block_idx] if past_key_values else None)
+                    continue
+
+                layer_past = None if past_key_values is None else past_key_values[block_idx]
+                if (
+                    (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
+                    or (
+                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
+                        and block_idx % 2 == 0
+                    )
+                    or (
+                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
+                        and block_idx % 3 == 0
+                    )
+                    or (
+                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
+                        and block_idx % 4 == 0
+                    )
+                ):
+                    x, cache = self._activation_checkpoint_fn(
+                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids
+                    )
+                else:
+                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids)
+                if attn_key_values is not None:
+                    assert cache is not None
+                    attn_key_values.append(cache)
+            
+            # ===== 合并：把不稳定 token 的结果放回 =====
+            if active_indices is not None and len(active_indices) > 0:
+                x_full[:, active_indices, :] = x
+                x = x_full
+            elif x_full is not None:
+                # 全部稳定，x 没变，直接用 x_full（它们是同一份数据的 clone）
+                x = x_full
         else:
             for group_idx, block_group in enumerate(self.transformer.block_groups):
                 if output_hidden_states:
@@ -1583,7 +1682,13 @@ class LLaDAModelLM(PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        replace_position: Optional[torch.Tensor] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
+        replace_position: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        # Token Skip 参数
+        skip_layer_k: int = None,
+        skip_threshold: float = 0.95,
+        skip_outlier: float = 0.7,
+        prev_hidden: Optional[List[torch.Tensor]] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1603,6 +1708,11 @@ class LLaDAModelLM(PreTrainedModel):
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             replace_position=replace_position,
+            position_ids=position_ids,
+            skip_layer_k=skip_layer_k,
+            skip_threshold=skip_threshold,
+            skip_outlier=skip_outlier,
+            prev_hidden=prev_hidden,
         )
         # import pdb; pdb.set_trace()
         logits = outputs.logits

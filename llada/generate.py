@@ -149,7 +149,198 @@ def generate_with_dual_cache(
 
     return x, nfe
 
+@torch.no_grad()  # 禁用梯度计算，推理时节省显存
+def generate_with_dual_cache_tokenskip(
+    model,           # LLaDA 模型
+    prompt,          # 输入 prompt 的 token ids，形状 (B, Lp)，B=batch_size, Lp=prompt长度
+    steps=128,       # 总的去噪步数
+    gen_length=128,  # 要生成的 token 数量
+    block_length=128,# 每个 block 的长度（semi-autoregressive 的单位）
+    temperature=0.,  # 采样温度，0 表示贪婪解码
+    remasking="low_confidence",  # 重掩码策略："low_confidence" 或 "random"
+    mask_id=126336,  # [MASK] token 的 id
+    threshold=None,  # 置信度阈值，超过这个值的 token 会被 unmask（并行解码模式）
+    factor=None,     # 动态阈值因子（用于 get_transfer_index_dynamic）
+    # Token Skip 超参
+    skip_layer_k=8,       # 判定用的前 K 层
+    skip_threshold=0.95,  # 平均 cos sim 阈值
+    skip_outlier=0.8,     # 偏离阈值
+):
+    """
+    使用 Dual Cache 的生成函数（你可以在这里添加 token skip 优化）
+    
+    整体流程：
+    1. 初始化：[prompt] + [MASK, MASK, ..., MASK]
+    2. 分 block 处理，每个 block 内迭代去噪
+    3. 每步选择高置信度的 token 进行 unmask
+    4. 最终输出：[prompt] + [生成的 tokens]
+    """
+    
+    # ==================== 初始化阶段 ====================
+    
+    # B = batch size（一次处理多少个样本）
+    B = prompt.shape[0]
+    
+    # Lp = prompt 的长度（token 数量）
+    Lp = int(prompt.shape[1])
+    
+    # 检查：生成长度必须能被 block 长度整除
+    assert gen_length % block_length == 0
+    
+    # 计算总共有多少个 block
+    # 例如：gen_length=128, block_length=32 → num_blocks=4
+    num_blocks = gen_length // block_length
 
+    # 检查：总步数必须能被 block 数整除
+    assert steps % num_blocks == 0
+    
+    # 每个 block 内的去噪步数
+    # 例如：steps=128, num_blocks=4 → steps_per_block=32
+    steps_per_block = steps // num_blocks
+
+    # 创建输出序列 x，初始化为全 [MASK]
+    # 形状：(B, Lp + gen_length)
+    # 例如：prompt 长度 100，生成长度 128 → x 形状 (B, 228)
+    x = torch.full((B, Lp + gen_length), mask_id, dtype=torch.long, device=model.device)
+    
+    # 把 prompt 复制到 x 的前面部分
+    # x = [prompt_token_1, prompt_token_2, ..., MASK, MASK, ..., MASK]
+    x[:, :Lp] = prompt
+
+    # NFE = Number of Forward Evaluations（模型前向传播次数，用于统计计算量）
+    nfe = 0
+
+    # ==================== 逐 Block 处理 ====================
+    
+    # 遍历每个 block
+    # 例如：num_blocks=4，则 nb = 0, 1, 2, 3
+    for nb in range(num_blocks):
+        
+        # s = 当前 block 的起始位置（在 x 中的索引）
+        # e = 当前 block 的结束位置
+        # 例如：nb=0, Lp=100, block_length=32 → s=100, e=132
+        # 例如：nb=1, Lp=100, block_length=32 → s=132, e=164
+        s = Lp + nb * block_length
+        e = s + block_length
+
+        # 找出当前 block 中哪些位置是 [MASK]
+        # block_mask_index: (B, block_length) 的 bool tensor
+        # True 表示该位置是 [MASK]，需要被预测
+        block_mask_index = (x[:, s:e] == mask_id)
+        
+        # 计算每一步应该 unmask 多少个 token（用于 quota 模式）
+        # num_transfer_tokens: (B, steps_per_block)
+        # 如果用 threshold 模式，这个值不会被使用
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+        # ==================== 第 1 步：完整前向，预热 KV Cache ====================
+        
+        # 对完整序列做一次前向传播
+        # use_cache=True 表示要保存 KV Cache
+        out_full = model(x, use_cache=True)
+        
+        # 保存 KV Cache，后续步骤会复用
+        # past_key_values 是一个 tuple，每层一个 (key, value) 对
+        past_key_values = out_full.past_key_values
+        
+        # 计数：完成一次前向传播
+        nfe += 1
+
+        # 创建 replace_position：标记当前 block 的位置
+        # 这个 tensor 告诉模型：在后续前向中，只更新这些位置的 KV Cache
+        # 形状：(B, Lp + gen_length)，全 False，只有 [s:e] 区间是 True
+        replace_position = torch.zeros_like(x, dtype=torch.bool)
+        replace_position[:, s:e] = True
+
+        # ==================== Step 0：基于完整 logits 做第一次 unmask ====================
+        
+        # 找出当前序列中所有的 [MASK] 位置
+        global_mask_index = (x == mask_id)
+        
+        # 只处理当前 block 及之前的 mask，不处理后面 block 的 mask
+        # 把 e 位置之后的 mask 标记设为 False
+        global_mask_index[:, e:] = False
+
+        # 根据 factor 参数选择使用哪种 transfer 策略
+        if factor is None:
+            # 使用 threshold 模式或 quota 模式
+            # 如果 threshold 不为 None，quota0 = None（使用 threshold 模式）
+            # 如果 threshold 为 None，quota0 = num_transfer_tokens[:, 0]（使用 quota 模式）
+            quota0 = None if threshold is not None else num_transfer_tokens[:, 0]
+            
+            # 调用 get_transfer_index 获取：
+            # - x0: 模型预测的 token（所有位置）
+            # - transfer_index: 哪些位置应该被 unmask（bool tensor）
+            x0, transfer_index = get_transfer_index(
+                out_full.logits,     # 模型输出的 logits
+                temperature,         # 采样温度
+                remasking,           # 重掩码策略
+                global_mask_index,   # 哪些位置是 [MASK]
+                x,                   # 当前序列
+                quota0,              # 这一步要 unmask 多少个（quota 模式）
+                threshold            # 置信度阈值（threshold 模式）
+            )
+        else:
+            # 使用动态阈值模式
+            x0, transfer_index = get_transfer_index_dynamic(
+                out_full.logits, temperature, remasking, global_mask_index, x, None, factor
+            )
+
+        # 更新序列 x：把选中位置的 [MASK] 替换为预测的 token
+        # torch.where(condition, x, y)：condition 为 True 时取 x，否则取 y
+        # transfer_index 为 True 的位置 → 用 x0（预测的 token）
+        # transfer_index 为 False 的位置 → 保持原来的 x
+        x = torch.where(transfer_index, x0, x)
+
+        # ==================== Step 1 ~ N：迭代 refinement ====================
+        
+        prev_hidden = None  # 用于 Token Skip 判定
+        
+        for i in range(1, steps_per_block):
+            # 提前退出：如果当前 block 已经没有 [MASK] 了，就不用继续了
+            if (x[:, s:e] == mask_id).sum() == 0:
+                break
+            
+            # 模型前向（Token Skip 逻辑在 model 内部双 loop 实现）
+            out_blk = model(
+                x[:, s:e],
+                past_key_values=past_key_values,
+                use_cache=True,
+                replace_position=replace_position,
+                output_hidden_states=True,
+                skip_layer_k=skip_layer_k,
+                skip_threshold=skip_threshold,
+                skip_outlier=skip_outlier,
+                prev_hidden=prev_hidden,
+            )
+            logits_blk = out_blk.logits
+            prev_hidden = out_blk.hidden_states  # 保存供下一 step 判定
+
+            # 找出当前 block 中哪些位置还是 [MASK]
+            mask_blk = (x[:, s:e] == mask_id)
+
+            # 选择 transfer 策略
+            if factor is None:
+                quota_i = None if threshold is not None else num_transfer_tokens[:, i]
+                x0_blk, transfer_idx_blk = get_transfer_index(
+                    logits_blk, temperature, remasking, mask_blk, x[:, s:e], quota_i, threshold
+                )
+            else:
+                x0_blk, transfer_idx_blk = get_transfer_index_dynamic(
+                    logits_blk, temperature, remasking, mask_blk, x[:, s:e], None, factor
+                )
+
+            # 更新当前 block 的 tokens
+            blk_old = x[:, s:e]
+            blk_new = torch.where(transfer_idx_blk, x0_blk, blk_old)
+            x = torch.cat([x[:, :s], blk_new, x[:, e:]], dim=1)
+
+            nfe += 1
+
+    # ==================== 返回结果 ====================
+    # x: 完整的输出序列，形状 (B, Lp + gen_length)
+    # nfe: 总共的前向传播次数
+    return x, nfe
 
 def get_transfer_index(
     logits: torch.Tensor,
