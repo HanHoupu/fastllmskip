@@ -54,7 +54,7 @@ from lm_eval.api.registry import register_model  # 模型注册装饰器
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from generate import generate, generate_with_prefix_cache, generate_with_dual_cache, generate_with_dual_cache_tokenskip
+from generate import generate_with_dual_cache, generate_with_dual_cache_tokenskip
 from model.modeling_llada import LLaDAModelLM
 import json
 import time
@@ -203,9 +203,13 @@ class LLaDAEvalHarness(LM):
         self.dual_cache = dual_cache  # 是否用 dual cache
         
         # Token Skip 参数（新版：基于最终 hidden state 判定）
-        self.token_skip = kwargs.get('token_skip', False)  # 是否启用 Token Skip
+        # 注意：从命令行传入的参数都是字符串，需要转换
+        token_skip_raw = kwargs.get('token_skip', 'False')
+        self.token_skip = str(token_skip_raw).lower() in ('true', '1', 'yes')  # 是否启用 Token Skip
         self.skip_threshold = float(kwargs.get('skip_threshold', 0.95))  # cos sim 阈值
         self.force_full_every_k = int(kwargs.get('force_full_every_k', 3))  # 每 K 步强制全算
+        
+        print(f"[Token Skip] enabled={self.token_skip}, threshold={self.skip_threshold}, force_full_every_k={self.force_full_every_k}")
     # ==================== 分布式相关属性 ====================
     
     @property
@@ -693,22 +697,9 @@ class LLaDAEvalHarness(LM):
                         threshold=self.threshold, 
                         factor=self.factor
                     )
-                else:
-                    # 使用 Prefix Cache 生成
-                    generated_answer, nfe = generate_with_prefix_cache(
-                        self.model, input_ids, 
-                        steps=self.steps, 
-                        gen_length=self.gen_length, 
-                        block_length=self.block_length, 
-                        temperature=0, 
-                        remasking=self.remasking, 
-                        mask_id=self.mask_id, 
-                        threshold=self.threshold, 
-                        factor=self.factor
-                    )
             else:
-                # 使用基础生成（最慢）
-                generated_answer, nfe = generate(
+                # 没有启用 cache，使用 dual_cache 作为默认
+                generated_answer, nfe = generate_with_dual_cache(
                     self.model, input_ids, 
                     steps=self.steps, 
                     gen_length=self.gen_length, 
