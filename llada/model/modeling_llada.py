@@ -446,50 +446,21 @@ class RotaryEmbedding(nn.Module):
         with torch.autocast(q.device.type, enabled=False):
             query_len, key_len = q_.shape[-2], k_.shape[-2]
             
-            # === TRACE: RoPE forward 入口 ===
-            try:
-                from trace_dataflow import trace
-                trace("ROPE_FWD_ENTRY", q=q_, k=k_, query_len=query_len, key_len=key_len,
-                      has_position_ids=position_ids is not None,
-                      block_end_index=block_end_index)
-            except: pass
-            
-            # 支持不连续位置：如果传了 position_ids，直接用；否则按原逻辑生成连续位置
             if position_ids is not None:
-                # TokenSkip 情况：需要用 max(position_ids)+1 来获取足够大的 embedding
+                # TokenSkip: 用离散 position_ids 应用 RoPE
                 max_pos = int(position_ids.max().item()) + 1
                 pos_sin, pos_cos = self.get_rotary_embedding(max_pos, q_.device)
                 pos_sin = pos_sin.type_as(q_)
                 pos_cos = pos_cos.type_as(q_)
                 
-                # === TRACE: TokenSkip RoPE 参数 ===
-                try:
-                    from trace_dataflow import trace
-                    trace("ROPE_TOKENSKIP_PARAMS", max_pos=max_pos, position_ids=position_ids,
-                          pos_sin=pos_sin, pos_cos=pos_cos)
-                except: pass
-                
-                # TokenSkip 情况：q 和 k 都是 active tokens，用离散 position_ids 应用 RoPE
                 idx = position_ids
                 pos_sin_slice = pos_sin.index_select(2, idx)
                 pos_cos_slice = pos_cos.index_select(2, idx)
                 
-                # === TRACE: index_select 结果 ===
-                try:
-                    from trace_dataflow import trace
-                    trace("ROPE_INDEX_SELECT", idx=idx, pos_sin_slice=pos_sin_slice, pos_cos_slice=pos_cos_slice)
-                except: pass
-                
                 q_ = self.apply_rotary_pos_emb(pos_sin_slice, pos_cos_slice, q_)
-                k_ = self.apply_rotary_pos_emb(pos_sin_slice, pos_cos_slice, k_)  # k 也需要应用 RoPE
-                
-                # === TRACE: RoPE 应用后 ===
-                try:
-                    from trace_dataflow import trace
-                    trace("ROPE_TOKENSKIP_RESULT", q_out=q_, k_out=k_)
-                except: pass
+                k_ = self.apply_rotary_pos_emb(pos_sin_slice, pos_cos_slice, k_)
             else:
-                # Baseline 情况：q 是当前 block，k 是完整 KV cache
+                # Baseline: 连续位置
                 pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
                 pos_sin = pos_sin.type_as(q_)
                 pos_cos = pos_cos.type_as(q_)
@@ -499,22 +470,10 @@ class RotaryEmbedding(nn.Module):
                 else:
                     idx = torch.arange(block_end_index - query_len, block_end_index, device=q_.device, dtype=torch.long)
                 
-                # === TRACE: baseline RoPE 参数 ===
-                try:
-                    from trace_dataflow import trace
-                    trace("ROPE_BASELINE_PARAMS", key_len=key_len, idx=idx, pos_sin=pos_sin)
-                except: pass
-                
                 pos_sin_slice = pos_sin.index_select(2, idx)
                 pos_cos_slice = pos_cos.index_select(2, idx)
                 q_ = self.apply_rotary_pos_emb(pos_sin_slice, pos_cos_slice, q_)
-                k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)  # K 用完整的位置编码
-                
-                # === TRACE: baseline RoPE 结果 ===
-                try:
-                    from trace_dataflow import trace
-                    trace("ROPE_BASELINE_RESULT", q_out=q_, k_out=k_)
-                except: pass
+                k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
 
         return q_.type_as(q), k_.type_as(k)
 
@@ -761,179 +720,74 @@ class LLaDABlock(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         replace_position: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,  # 新增：支持不连续位置
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        # === TRACE: attention 入口 ===
-        try:
-            from trace_dataflow import trace
-            trace("ATTN_ENTRY", q_in=q, k_in=k, v_in=v,
-                  has_layer_past=layer_past is not None,
-                  has_replace_position=replace_position is not None,
-                  has_position_ids=position_ids is not None)
-            if position_ids is not None:
-                trace("ATTN_POSITION_IDS", position_ids=position_ids)
-        except: pass
-        
-        B, T, C = q.size()  # batch size, sequence length, d_model
+        B, T, C = q.size()
         dtype = k.dtype
 
-        # Optionally apply layer norm to keys and queries.
-        if self.q_norm is not None and self.k_norm is not None: #self.q_norm: None, self.k_norm: None
+        if self.q_norm is not None and self.k_norm is not None:
             q = self.q_norm(q).to(dtype=dtype)
             k = self.k_norm(k).to(dtype=dtype)
 
-        # Move head forward to be next to the batch dim.
         # shape: (B, nh, T, hs)
-        # self.config.n_heads: 32
         q = q.view(B, T, self.config.n_heads, C // self.config.n_heads).transpose(1, 2)
-        # shape: (B, n_kv_h, T, hs)
         k = k.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
-        # shape: (B, n_kv_h, T, hs)
         v = v.view(B, T, self.config.effective_n_kv_heads, C // self.config.n_heads).transpose(1, 2)
-        
-        # === TRACE: reshape 后 ===
-        try:
-            from trace_dataflow import trace
-            trace("ATTN_AFTER_RESHAPE", q=q, k=k, v=v)
-        except: pass
 
-        if layer_past is not None: 
+        if layer_past is not None:
             past_key, past_value = layer_past
-            # === TRACE: KV cache 状态 ===
-            try:
-                from trace_dataflow import trace
-                trace("KV_CACHE_BEFORE", past_key=past_key, past_value=past_value, new_k=k, new_v=v)
-            except: pass
             
             if replace_position is None:
                 k = torch.cat((past_key, k), dim=-2)
                 v = torch.cat((past_value, v), dim=-2)
-                # === TRACE: concat 后 ===
-                try:
-                    from trace_dataflow import trace
-                    trace("KV_CACHE_CONCAT", k_after=k, v_after=v)
-                except: pass
             else:
-                # Token Skip 情况：先对新的 k 应用 RoPE，再更新 cache
+                # Token Skip: 先对新的 k 应用 RoPE，再更新 cache
                 if position_ids is not None and self.config.rope:
-                    # === TRACE: RoPE 应用前 ===
-                    try:
-                        from trace_dataflow import trace
-                        trace("ROPE_BEFORE_TOKENSKIP", q_before=q, k_before=k, position_ids=position_ids)
-                    except: pass
-                    # 对新计算的 k 应用 RoPE（用离散 position_ids）
                     q, k = self.rotary_emb(q, k, position_ids=position_ids)
-                    # === TRACE: RoPE 应用后 ===
-                    try:
-                        from trace_dataflow import trace
-                        trace("ROPE_AFTER_TOKENSKIP", q_after=q, k_after=k)
-                    except: pass
                 
-                # k shape is [B, n_kv_h, selected_length, hs]
-                # replace_position shape is [B, L], where L contains 0s and 1s, 0 means no replacement, 1 means replace, with selected_length number of 1s
-                # past_key shape is [B, n_kv_h, L, hs]
-                # Replace selected_length number of 1s in past_key with k
-                
-                # Handle batched replace_position correctly
-                B = replace_position.shape[0]
-                for batch_idx in range(B):
-                    # Get indices for this batch
+                # 更新 KV cache 的指定位置
+                batch_size = replace_position.shape[0]
+                for batch_idx in range(batch_size):
                     batch_replace_indices = replace_position[batch_idx].nonzero(as_tuple=True)[0]
                     if len(batch_replace_indices) > 0:
-                        # === TRACE: cache 更新 ===
-                        try:
-                            from trace_dataflow import trace
-                            trace("KV_CACHE_UPDATE", batch_idx=batch_idx,
-                                  replace_indices=batch_replace_indices,
-                                  k_to_insert=k[batch_idx, :, :len(batch_replace_indices)])
-                        except: pass
-                        # Replace positions in past_key and past_value for this batch
                         past_key[batch_idx, :, batch_replace_indices] = k[batch_idx, :, :len(batch_replace_indices)]
                         past_value[batch_idx, :, batch_replace_indices] = v[batch_idx, :, :len(batch_replace_indices)]
                 
                 k = past_key
                 v = past_value
-                # === TRACE: replace 后 ===
-                try:
-                    from trace_dataflow import trace
-                    trace("KV_CACHE_AFTER_REPLACE", k_final=k, v_final=v)
-                except: pass
 
-        present = (k, v) if use_cache else None #present: None
-        query_len, key_len = q.shape[-2], k.shape[-2]  # could be different if layer_past not None
+        present = (k, v) if use_cache else None
+        query_len, key_len = q.shape[-2], k.shape[-2]
 
         if self.config.rope:
-            # Apply rotary embeddings.
             if position_ids is not None:
-                # Token Skip 情况：RoPE 已在上面应用，这里跳过
-                try:
-                    from trace_dataflow import trace
-                    trace("ROPE_SKIP", reason="already_applied_above")
-                except: pass
+                # Token Skip: RoPE 已在上面应用
                 pass
             elif replace_position is None:
-                # === TRACE: baseline RoPE ===
-                try:
-                    from trace_dataflow import trace
-                    trace("ROPE_BASELINE_BEFORE", q=q, k=k, query_len=query_len, key_len=key_len)
-                except: pass
                 q, k = self.rotary_emb(q, k)
-                try:
-                    from trace_dataflow import trace
-                    trace("ROPE_BASELINE_AFTER", q=q, k=k)
-                except: pass
             else:
-                # For batched replace_position, use the maximum position across all batches
                 max_replace_pos = replace_position.nonzero(as_tuple=True)[1].max() + 1 if replace_position.any() else key_len
-                # === TRACE: replace RoPE ===
-                try:
-                    from trace_dataflow import trace
-                    trace("ROPE_REPLACE_BEFORE", q=q, k=k, max_replace_pos=max_replace_pos)
-                except: pass
                 q, k = self.rotary_emb(q, k, max_replace_pos)
-                try:
-                    from trace_dataflow import trace
-                    trace("ROPE_REPLACE_AFTER", q=q, k=k)
-                except: pass
 
         if attention_bias is not None:
-            # Resize and cast attention bias.
-            # The current dtype of the attention bias might not match the dtype that the SDP attn function will
-            # run in if AMP is enabled, and this can be a problem if some tokens are masked out due to padding
-            # as down-casting the attention bias to the autocast precision will result in -infs, which will
-            # cause the SDP attn function to produce NaNs.
-            
             if position_ids is not None:
-                # Token Skip 情况：用 position_ids 索引 attention_bias，而非假设是最后几个位置
-                # position_ids 是 active tokens 的全局位置，形如 [19, 20]
-                # 需要取 attention_bias[:, :, position_ids, :key_len]
+                # Token Skip: 用 position_ids 索引 attention_bias
                 attention_bias = self._cast_attn_bias(
                     attention_bias[:, :, position_ids, :key_len], dtype
                 )
-                # === TRACE: Token Skip attention_bias ===
-                try:
-                    from trace_dataflow import trace
-                    trace("ATTN_BIAS_TOKENSKIP", attention_bias=attention_bias, position_ids=position_ids)
-                except: pass
             else:
                 attention_bias = self._cast_attn_bias(
                     attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype
                 )
 
-        # Get the attention scores.
-        # shape: (B, nh, T, hs)
         att = self._scaled_dot_product_attention(
-            q,
-            k,
-            v,
+            q, k, v,
             attn_mask=None,
             dropout_p=0.0 if not self.training else self.config.attention_dropout,
             is_causal=False,
         )
-        # Re-assemble all head outputs side-by-side.
         att = att.transpose(1, 2).contiguous().view(B, T, C)
 
-        # Apply output projection.
         return self.attn_out(att), present
 
 
@@ -1272,11 +1126,6 @@ class LLaDAOutput(NamedTuple):
     """
     Token Skip: 这一轮被 skip 的 token 索引（下一轮必须算）
     """
-    
-    skipped_indices: Optional[torch.Tensor] = None
-    """
-    Token Skip: 这一轮被 skip 的 token 索引（下一轮必须算）
-    """
 
 
 class LLaDAGenerateOutput(NamedTuple):
@@ -1497,13 +1346,13 @@ class LLaDAModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,  # 支持不连续位置
-        # Token Skip 参数
-        skip_layer_k: int = None,       # 判定用的前 K 层
-        skip_threshold: float = 0.95,   # 平均 cos sim 阈值
-        skip_outlier: float = 0.6,      # 偏离阈值
-        prev_hidden: Optional[List[torch.Tensor]] = None,  # 上一 step 的 hidden states
-        current_step: int = None,       # 当前 step，用于每隔 3 步强制全算
-        prev_skipped_indices: Optional[torch.Tensor] = None,  # 上一轮 skip 的 token 索引
+        # Token Skip 参数（新版：基于最终 hidden state 判定，在 forward 之前决定）
+        skip_threshold: float = 0.95,   # cos sim 阈值
+        prev_final_hidden: Optional[torch.Tensor] = None,  # 上一 step 的最终 hidden state (B, L, d)
+        prev_prev_final_hidden: Optional[torch.Tensor] = None,  # 上上一 step 的最终 hidden state
+        current_step: int = None,       # 当前 step
+        prev_skipped_indices: Optional[torch.Tensor] = None,  # 上一轮 skip 的 token 索引（这轮必须算）
+        force_full_every_k: int = 3,    # 每 K 步强制全部重算（0 表示禁用）
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1619,204 +1468,98 @@ class LLaDAModel(nn.Module):
         # decoder layers
         all_hidden_states = []
         
-        # Token Skip 相关
-        skip_enabled = skip_layer_k is not None and prev_hidden is not None
+        # ===== Token Skip（新版）：在任何层之前判定 =====
+        # 判定条件：需要 prev_final_hidden 和 prev_prev_final_hidden 都存在
+        # 判定方法：cos_sim(h_{t-1}, h_{t-2})，如果 > threshold 则 skip
+        # Skip 效果：被 skip 的 token 完全不参与任何层的计算
+        
         active_indices = None
         orig_seq_len = x.shape[1]
         x_full = None  # 保存完整的 x，用于合并
         skipped_indices = None  # 记录被 skip 的 token 索引
+        orig_replace_position = replace_position  # 保存原始的 replace_position
+        orig_position_ids = position_ids
         
-        # #region agent log - Token Skip 入口
-        import json, os
-        _debug_log_path = r"d:\fastllmskip\.cursor\debug.log"
-        def _log(msg, data=None):
-            try:
-                with open(_debug_log_path, "a") as f:
-                    f.write(json.dumps({"msg": msg, "data": data}) + "\n")
-            except: pass
-        _log("SKIP_ENTRY", {"skip_enabled": skip_enabled, "skip_layer_k": skip_layer_k, "prev_hidden_is_none": prev_hidden is None, "x_shape": list(x.shape)})
-        # #endregion
+        # 判定是否启用 skip
+        skip_enabled = (prev_final_hidden is not None and 
+                        prev_prev_final_hidden is not None)
         
-        # === TRACE: Model forward 入口 ===
-        try:
-            from trace_dataflow import trace, trace_context
-            trace("MODEL_FWD_ENTRY", x=x, skip_enabled=skip_enabled, skip_layer_k=skip_layer_k,
-                  has_prev_hidden=prev_hidden is not None,
-                  has_past_key_values=past_key_values is not None,
-                  has_replace_position=replace_position is not None)
-            if prev_hidden is not None:
-                trace("MODEL_PREV_HIDDEN_INFO", num_layers=len(prev_hidden),
-                      layer0_shape=list(prev_hidden[0].shape) if len(prev_hidden) > 0 else None)
-        except: pass
-
-        # Apply blocks one-by-one.
-        if self.config.block_group_size == 1:
-            num_layers = len(self.transformer.blocks)
-            split_layer = skip_layer_k if skip_enabled else num_layers
+        # 强制全算的条件
+        force_full = (force_full_every_k > 0 and 
+                      current_step is not None and 
+                      current_step % force_full_every_k == 0)
+        
+        if skip_enabled and not force_full:
+            B, L, _ = x.shape
             
-            # ===== Loop 1: 前 K 层（所有 token）=====
-            for block_idx in range(min(split_layer, num_layers)):
-                block = self.transformer.blocks[block_idx]
-                if output_hidden_states:
-                    all_hidden_states.append(x)
-
-                layer_past = None if past_key_values is None else past_key_values[block_idx]
-                if (
-                    (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
-                        and block_idx % 2 == 0
-                    )
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
-                        and block_idx % 3 == 0
-                    )
-                    or (
-                        self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
-                        and block_idx % 4 == 0
-                    )
-                ):
-                    x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids
-                    )
-                else:
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids)
-                if attn_key_values is not None:
-                    assert cache is not None
-                    attn_key_values.append(cache)
+            # 处理维度对齐（prev 可能是完整序列，当前只是 block）
+            prev_seq_len = prev_final_hidden.shape[1]
+            prev_prev_seq_len = prev_prev_final_hidden.shape[1]
             
-            # ===== 判定：哪些 token 稳定 =====
-            # 每隔 3 步强制全算（阈值变为 1，等价于不 skip）
-            effective_threshold = skip_threshold
-            force_full = current_step is not None and current_step % 3 == 0
-            if force_full:
-                effective_threshold = 1.0
+            # 计算 offset：当前 block 在全局序列中的起始位置
+            if prev_seq_len > L and replace_position is not None:
+                block_start = replace_position[0].nonzero(as_tuple=True)[0][0].item()
+                offset = block_start
+            else:
+                offset = 0
             
-            if skip_enabled and split_layer < num_layers:
-                L = x.shape[1]
-                active_mask = torch.ones(L, dtype=torch.bool, device=x.device)
-                cos_sims_debug = []  # 记录所有 token 的 cos_sim
+            # 提取对应位置的 hidden states
+            h_t1 = prev_final_hidden[:, offset:offset+L, :]  # (B, L, d)
+            h_t2 = prev_prev_final_hidden[:, offset:offset+L, :] if prev_prev_seq_len > L else prev_prev_final_hidden  # (B, L, d)
+            
+            # 确保维度匹配
+            if h_t1.shape[1] == L and h_t2.shape[1] == L:
+                # 计算 cos_sim(h_{t-1}, h_{t-2})
+                cos_sim = F.cosine_similarity(h_t1.float(), h_t2.float(), dim=-1)  # (B, L)
+                cos_sim = cos_sim.clamp(-1.0, 1.0)
                 
-                # === TRACE: 判定开始 ===
-                try:
-                    from trace_dataflow import trace
-                    trace("SKIP_JUDGE_START", L=L, split_layer=split_layer, num_layers=num_layers,
-                          x_before_judge=x,
-                          all_hidden_states_len=len(all_hidden_states),
-                          prev_hidden_len=len(prev_hidden) if prev_hidden else 0,
-                          force_full=force_full, current_step=current_step)
-                except: pass
-                
-                for j in range(L):
-                    cos_sims = []
-                    for layer in range(1, min(skip_layer_k, len(all_hidden_states))):
-                        h1 = prev_hidden[layer][0, j, :]
-                        h2 = all_hidden_states[layer][0, j, :]
-                        cos = F.cosine_similarity(h1.unsqueeze(0), h2.unsqueeze(0), dim=-1).item()
-                        cos = min(1.0, cos)  # clamp: bfloat16 精度问题可能导致 >1
-                        cos_sims.append(cos)
-                        
-                        # === TRACE: 每个 token 每层的 cos_sim ===
-                        if j < 3 and layer < 3:  # 只追踪前几个，避免太多
-                            try:
-                                from trace_dataflow import trace
-                                trace("SKIP_COS_SIM_DETAIL", token_j=j, layer=layer,
-                                      h1=h1, h2=h2, cos_sim=cos)
-                            except: pass
-                    
-                    if len(cos_sims) > 0:
-                        avg_cos = sum(cos_sims) / len(cos_sims)
-                        min_cos = min(cos_sims)
-                        cos_sims_debug.append({"j": j, "avg": round(avg_cos, 4), "min": round(min_cos, 4)})
-                        if min_cos >= skip_outlier and avg_cos > effective_threshold:
-                            active_mask[j] = False  # 稳定，踢出
+                # 判定：cos_sim > threshold 则稳定（可 skip）
+                stable_mask = cos_sim > skip_threshold  # (B, L)
+                active_mask = ~stable_mask  # 不稳定的需要计算
                 
                 # 上一轮 skip 的 token 这轮必须算
                 if prev_skipped_indices is not None and len(prev_skipped_indices) > 0:
-                    active_mask[prev_skipped_indices] = True
-                
-                # #region agent log - 判定结果
-                num_stable = int((~active_mask).sum().item())
-                num_active = int(active_mask.sum().item())
-                _log("SKIP_JUDGE", {
-                    "L": L, "num_stable": num_stable, "num_active": num_active,
-                    "skip_threshold": skip_threshold, "skip_outlier": skip_outlier,
-                    "cos_sims_sample": cos_sims_debug[:5] if cos_sims_debug else []
-                })
-                # #endregion
-                
-                # === TRACE: 判定结果 ===
-                try:
-                    from trace_dataflow import trace
-                    trace("SKIP_JUDGE_RESULT", num_stable=num_stable, num_active=num_active,
-                          active_mask=active_mask, cos_sims_all=cos_sims_debug)
-                except: pass
+                    active_mask[:, prev_skipped_indices] = True
                 
                 # 记录被 skip 的 token 索引（下一轮必须算）
-                skipped_indices = (~active_mask).nonzero(as_tuple=True)[0] if not active_mask.all() else None
+                skipped_indices = (~active_mask[0]).nonzero(as_tuple=True)[0] if not active_mask[0].all() else None
                 
-                # 只取不稳定的 token
-                if not active_mask.all() and active_mask.any():
-                    # #region agent log - 部分 skip 分支
-                    _log("SKIP_BRANCH", {"branch": "PARTIAL_SKIP", "active_count": num_active, "stable_count": num_stable})
-                    # #endregion
-                    # 有稳定的，也有不稳定的
-                    active_indices = active_mask.nonzero(as_tuple=True)[0]
+                # 取所有 batch 的并集（简化实现）
+                any_active = active_mask.any(dim=0)  # (L,)
+                
+                if not any_active.all() and any_active.any():
+                    # 有稳定的，也有不稳定的 → 只计算 active tokens
+                    active_indices = any_active.nonzero(as_tuple=True)[0]
                     x_full = x.clone()
-                    x = x[:, active_indices, :].clone()  # 确保独立内存
-                    
-                    # === TRACE: 部分 skip ===
-                    try:
-                        from trace_dataflow import trace
-                        trace("SKIP_PARTIAL", active_indices=active_indices, x_after_select=x, x_full=x_full)
-                    except: pass
+                    x = x[:, active_indices, :].clone()
                     
                     # 更新 replace_position：只标记 active 的位置
                     if replace_position is not None:
                         new_replace = torch.zeros_like(replace_position)
-                        active_global = replace_position.nonzero(as_tuple=True)[1][active_indices]
+                        block_positions = replace_position[0].nonzero(as_tuple=True)[0]
+                        active_global = block_positions[active_indices]
                         new_replace[:, active_global] = True
                         replace_position = new_replace
-                        position_ids = active_global  # 用全局位置，不是局部位置！
-                        
-                        # === TRACE: position 更新 ===
-                        try:
-                            from trace_dataflow import trace
-                            trace("SKIP_POSITION_UPDATE", active_global=active_global,
-                                  new_replace_position=replace_position, position_ids=position_ids)
-                        except: pass
-                        
-                        # #region agent log - position_ids 设置
-                        _log("SKIP_POSITION", {"active_global": active_global.tolist(), "new_x_shape": list(x.shape)})
-                        # #endregion
+                        position_ids = active_global
                     else:
-                        position_ids = active_indices  # 没有 replace_position 时用局部位置
-                elif not active_mask.any():
-                    # #region agent log - 全部 skip 分支
-                    _log("SKIP_BRANCH", {"branch": "ALL_SKIP", "active_count": 0, "stable_count": L})
-                    # #endregion
-                    # 全部稳定，直接跳过 Loop 2
-                    x_full = x.clone()  # 确保独立内存
+                        position_ids = active_indices
+                        
+                elif not any_active.any():
+                    # 全部稳定 → 完全跳过所有层
+                    x_full = x.clone()
                     active_indices = torch.tensor([], dtype=torch.long, device=x.device)
-                    
-                    # === TRACE: 全部 skip ===
-                    try:
-                        from trace_dataflow import trace
-                        trace("SKIP_ALL", x_full=x_full)
-                    except: pass
-                else:
-                    # #region agent log - 不 skip 分支
-                    _log("SKIP_BRANCH", {"branch": "NO_SKIP", "active_count": L, "stable_count": 0})
-                    # #endregion
+
+        # Apply blocks one-by-one.
+        if self.config.block_group_size == 1:
+            num_layers = len(self.transformer.blocks)
             
-            # ===== Loop 2: 后面的层（只跑不稳定的 token）=====
-            # 如果所有 token 都稳定，跳过 Loop 2
-            skip_loop2 = active_indices is not None and len(active_indices) == 0
+            # 如果全部稳定，跳过所有层
+            skip_all_layers = active_indices is not None and len(active_indices) == 0
             
-            for block_idx in range(split_layer, num_layers):
+            for block_idx in range(num_layers):
                 block = self.transformer.blocks[block_idx]
                 if output_hidden_states:
-                    # 如果有 token 被 skip，需要合并成完整形状再 append
+                    # 记录 hidden states（如果有 skip，需要合并成完整形状）
                     if active_indices is not None and len(active_indices) > 0:
                         x_for_record = x_full.clone()
                         x_for_record[:, active_indices, :] = x
@@ -1826,8 +1569,8 @@ class LLaDAModel(nn.Module):
                     else:
                         all_hidden_states.append(x)
                 
-                if skip_loop2:
-                    # 全部稳定，只记录 hidden states，不计算
+                if skip_all_layers:
+                    # 全部稳定，只记录 KV cache，不计算
                     if attn_key_values is not None:
                         attn_key_values.append(past_key_values[block_idx] if past_key_values else None)
                     continue
@@ -1857,12 +1600,12 @@ class LLaDAModel(nn.Module):
                     assert cache is not None
                     attn_key_values.append(cache)
             
-            # ===== 合并：把不稳定 token 的结果放回 =====
+            # ===== 合并：把 active token 的结果放回 =====
             if active_indices is not None and len(active_indices) > 0:
                 x_full[:, active_indices, :] = x
                 x = x_full
             elif x_full is not None:
-                # 全部稳定，x 没变，直接用 x_full（它们是同一份数据的 clone）
+                # 全部稳定，x 没变，直接用 x_full
                 x = x_full
         else:
             for group_idx, block_group in enumerate(self.transformer.block_groups):
@@ -1954,13 +1697,13 @@ class LLaDAModelLM(PreTrainedModel):
         return_dict: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        # Token Skip 参数
-        skip_layer_k: int = None,
+        # Token Skip 参数（新版：基于最终 hidden state 判定）
         skip_threshold: float = 0.95,
-        skip_outlier: float = 0.7,
-        prev_hidden: Optional[List[torch.Tensor]] = None,
+        prev_final_hidden: Optional[torch.Tensor] = None,  # 上一 step 的最终 hidden state
+        prev_prev_final_hidden: Optional[torch.Tensor] = None,  # 上上一 step 的最终 hidden state
         current_step: int = None,
         prev_skipped_indices: Optional[torch.Tensor] = None,
+        force_full_every_k: int = 3,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1969,7 +1712,6 @@ class LLaDAModelLM(PreTrainedModel):
             raise ValueError("output_attentions is not yet supported in LLaDA")
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        # import pdb; pdb.set_trace()
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model.forward(
             input_ids=input_ids,
@@ -1981,12 +1723,12 @@ class LLaDAModelLM(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             replace_position=replace_position,
             position_ids=position_ids,
-            skip_layer_k=skip_layer_k,
             skip_threshold=skip_threshold,
-            skip_outlier=skip_outlier,
-            prev_hidden=prev_hidden,
+            prev_final_hidden=prev_final_hidden,
+            prev_prev_final_hidden=prev_prev_final_hidden,
             current_step=current_step,
             prev_skipped_indices=prev_skipped_indices,
+            force_full_every_k=force_full_every_k,
         )
         # import pdb; pdb.set_trace()
         logits = outputs.logits

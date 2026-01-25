@@ -54,7 +54,7 @@ from lm_eval.api.registry import register_model  # 模型注册装饰器
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from generate import generate, generate_with_prefix_cache, generate_with_dual_cache
+from generate import generate, generate_with_prefix_cache, generate_with_dual_cache, generate_with_dual_cache_tokenskip
 from model.modeling_llada import LLaDAModelLM
 import json
 import time
@@ -201,6 +201,11 @@ class LLaDAEvalHarness(LM):
         self.save_dir = save_dir  # 保存路径（断点续跑）
         self.show_speed = show_speed  # 速度统计
         self.dual_cache = dual_cache  # 是否用 dual cache
+        
+        # Token Skip 参数（新版：基于最终 hidden state 判定）
+        self.token_skip = kwargs.get('token_skip', False)  # 是否启用 Token Skip
+        self.skip_threshold = float(kwargs.get('skip_threshold', 0.95))  # cos sim 阈值
+        self.force_full_every_k = int(kwargs.get('force_full_every_k', 3))  # 每 K 步强制全算
     # ==================== 分布式相关属性 ====================
     
     @property
@@ -660,8 +665,23 @@ class LLaDAEvalHarness(LM):
             input_ids = batched_input_ids
             
             if self.use_cache:
-                if self.dual_cache:
-                    # 使用 Dual Cache 生成（最快）
+                if self.dual_cache and self.token_skip:
+                    # 使用 Dual Cache + Token Skip 生成（新版：基于最终 hidden state 判定）
+                    generated_answer, nfe = generate_with_dual_cache_tokenskip(
+                        self.model, input_ids, 
+                        steps=self.steps, 
+                        gen_length=self.gen_length, 
+                        block_length=self.block_length, 
+                        temperature=0,  # 贪婪解码
+                        remasking=self.remasking, 
+                        mask_id=self.mask_id, 
+                        threshold=self.threshold, 
+                        factor=self.factor,
+                        skip_threshold=self.skip_threshold,
+                        force_full_every_k=self.force_full_every_k,
+                    )
+                elif self.dual_cache:
+                    # 使用 Dual Cache 生成（不带 Token Skip）
                     generated_answer, nfe = generate_with_dual_cache(
                         self.model, input_ids, 
                         steps=self.steps, 
