@@ -202,14 +202,13 @@ class LLaDAEvalHarness(LM):
         self.show_speed = show_speed  # 速度统计
         self.dual_cache = dual_cache  # 是否用 dual cache
         
-        # Token Skip 参数（新版：基于最终 hidden state 判定）
+        # Token Skip 参数（新版：基于最后四层 hidden state 判定，硬编码阈值 0.75）
         # 注意：从命令行传入的参数都是字符串，需要转换
         token_skip_raw = kwargs.get('token_skip', 'False')
         self.token_skip = str(token_skip_raw).lower() in ('true', '1', 'yes')  # 是否启用 Token Skip
-        self.skip_threshold = float(kwargs.get('skip_threshold', 0.95))  # cos sim 阈值
         self.force_full_every_k = int(kwargs.get('force_full_every_k', 3))  # 每 K 步强制全算
         
-        print(f"[Token Skip] enabled={self.token_skip}, threshold={self.skip_threshold}, force_full_every_k={self.force_full_every_k}")
+        print(f"[Token Skip] enabled={self.token_skip}, threshold=0.75 (hardcoded), force_full_every_k={self.force_full_every_k}")
     # ==================== 分布式相关属性 ====================
     
     @property
@@ -670,7 +669,7 @@ class LLaDAEvalHarness(LM):
             
             if self.use_cache:
                 if self.dual_cache and self.token_skip:
-                    # 使用 Dual Cache + Token Skip 生成（新版：基于最终 hidden state 判定）
+                    # 使用 Dual Cache + Token Skip 生成（基于最后四层，硬编码阈值 0.75）
                     generated_answer, nfe = generate_with_dual_cache_tokenskip(
                         self.model, input_ids, 
                         steps=self.steps, 
@@ -681,7 +680,6 @@ class LLaDAEvalHarness(LM):
                         mask_id=self.mask_id, 
                         threshold=self.threshold, 
                         factor=self.factor,
-                        skip_threshold=self.skip_threshold,
                         force_full_every_k=self.force_full_every_k,
                     )
                 elif self.dual_cache:

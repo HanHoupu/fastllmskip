@@ -1346,10 +1346,10 @@ class LLaDAModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,  # 支持不连续位置
-        # Token Skip 参数（新版：基于最终 hidden state 判定，在 forward 之前决定）
-        skip_threshold: float = 0.95,   # cos sim 阈值
-        prev_final_hidden: Optional[torch.Tensor] = None,  # 上一 step 的最终 hidden state (B, L, d)
-        prev_prev_final_hidden: Optional[torch.Tensor] = None,  # 上上一 step 的最终 hidden state
+        # Token Skip 参数（新版：基于最后四层 hidden state 判定）
+        # 硬编码阈值 0.75：如果四层中任意一层 cos_sim > 0.75 → 必须 forward
+        prev_last4_hidden: Optional[List[torch.Tensor]] = None,  # 上一 step 的最后四层 hidden state
+        prev_prev_last4_hidden: Optional[List[torch.Tensor]] = None,  # 上上一 step 的最后四层
         current_step: int = None,       # 当前 step
         prev_skipped_indices: Optional[torch.Tensor] = None,  # 上一轮 skip 的 token 索引（这轮必须算）
         force_full_every_k: int = 3,    # 每 K 步强制全部重算（0 表示禁用）
@@ -1468,10 +1468,11 @@ class LLaDAModel(nn.Module):
         # decoder layers
         all_hidden_states = []
         
-        # ===== Token Skip（新版）：在任何层之前判定 =====
-        # 判定条件：需要 prev_final_hidden 和 prev_prev_final_hidden 都存在
-        # 判定方法：cos_sim(h_{t-1}, h_{t-2})，如果 > threshold 则 skip
-        # Skip 效果：被 skip 的 token 完全不参与任何层的计算
+        # ===== Token Skip（新版）：基于最后四层 hidden state 判定 =====
+        # 硬编码阈值 0.75
+        # 判定：如果四层中任意一层 cos_sim > 0.75 → 必须 forward（不 skip）
+        # 只有四层的 cos_sim 都 <= 0.75 时，才 skip
+        SKIP_THRESHOLD = 0.75  # 硬编码阈值
         
         active_indices = None
         orig_seq_len = x.shape[1]
@@ -1480,9 +1481,11 @@ class LLaDAModel(nn.Module):
         orig_replace_position = replace_position  # 保存原始的 replace_position
         orig_position_ids = position_ids
         
-        # 判定是否启用 skip
-        skip_enabled = (prev_final_hidden is not None and 
-                        prev_prev_final_hidden is not None)
+        # 判定是否启用 skip（需要两个 step 的最后四层都存在）
+        skip_enabled = (prev_last4_hidden is not None and 
+                        prev_prev_last4_hidden is not None and
+                        len(prev_last4_hidden) == 4 and 
+                        len(prev_prev_last4_hidden) == 4)
         
         # 强制全算的条件
         force_full = (force_full_every_k > 0 and 
@@ -1493,8 +1496,8 @@ class LLaDAModel(nn.Module):
             B, L, _ = x.shape
             
             # 处理维度对齐（prev 可能是完整序列，当前只是 block）
-            prev_seq_len = prev_final_hidden.shape[1]
-            prev_prev_seq_len = prev_prev_final_hidden.shape[1]
+            prev_seq_len = prev_last4_hidden[0].shape[1]
+            prev_prev_seq_len = prev_prev_last4_hidden[0].shape[1]
             
             # 计算 offset：当前 block 在全局序列中的起始位置
             if prev_seq_len > L and replace_position is not None:
@@ -1503,51 +1506,57 @@ class LLaDAModel(nn.Module):
             else:
                 offset = 0
             
-            # 提取对应位置的 hidden states
-            h_t1 = prev_final_hidden[:, offset:offset+L, :]  # (B, L, d)
-            h_t2 = prev_prev_final_hidden[:, offset:offset+L, :] if prev_prev_seq_len > L else prev_prev_final_hidden  # (B, L, d)
+            # 对四层分别计算 cos_sim，检查是否有任意一层 > 0.75
+            # 如果有 → active（必须 forward）
+            # 如果四层都 <= 0.75 → 可以 skip
+            active_mask = torch.zeros(B, L, dtype=torch.bool, device=x.device)
             
-            # 确保维度匹配
-            if h_t1.shape[1] == L and h_t2.shape[1] == L:
-                # 计算 cos_sim(h_{t-1}, h_{t-2})
-                cos_sim = F.cosine_similarity(h_t1.float(), h_t2.float(), dim=-1)  # (B, L)
-                cos_sim = cos_sim.clamp(-1.0, 1.0)
+            for layer_idx in range(4):
+                h_t1 = prev_last4_hidden[layer_idx][:, offset:offset+L, :]  # (B, L, d)
+                h_t2_full = prev_prev_last4_hidden[layer_idx]
+                h_t2 = h_t2_full[:, offset:offset+L, :] if prev_prev_seq_len > L else h_t2_full  # (B, L, d)
                 
-                # 判定：cos_sim > threshold 则稳定（可 skip）
-                stable_mask = cos_sim > skip_threshold  # (B, L)
-                active_mask = ~stable_mask  # 不稳定的需要计算
-                
-                # 上一轮 skip 的 token 这轮必须算
-                if prev_skipped_indices is not None and len(prev_skipped_indices) > 0:
-                    active_mask[:, prev_skipped_indices] = True
-                
-                # 记录被 skip 的 token 索引（下一轮必须算）
-                skipped_indices = (~active_mask[0]).nonzero(as_tuple=True)[0] if not active_mask[0].all() else None
-                
-                # 取所有 batch 的并集（简化实现）
-                any_active = active_mask.any(dim=0)  # (L,)
-                
-                if not any_active.all() and any_active.any():
-                    # 有稳定的，也有不稳定的 → 只计算 active tokens
-                    active_indices = any_active.nonzero(as_tuple=True)[0]
-                    x_full = x.clone()
-                    x = x[:, active_indices, :].clone()
+                # 确保维度匹配
+                if h_t1.shape[1] == L and h_t2.shape[1] == L:
+                    # 计算 cos_sim
+                    cos_sim = F.cosine_similarity(h_t1.float(), h_t2.float(), dim=-1)  # (B, L)
+                    cos_sim = cos_sim.clamp(-1.0, 1.0)
                     
-                    # 更新 replace_position：只标记 active 的位置
-                    if replace_position is not None:
-                        new_replace = torch.zeros_like(replace_position)
-                        block_positions = replace_position[0].nonzero(as_tuple=True)[0]
-                        active_global = block_positions[active_indices]
-                        new_replace[:, active_global] = True
-                        replace_position = new_replace
-                        position_ids = active_global
-                    else:
-                        position_ids = active_indices
-                        
-                elif not any_active.any():
-                    # 全部稳定 → 完全跳过所有层
-                    x_full = x.clone()
-                    active_indices = torch.tensor([], dtype=torch.long, device=x.device)
+                    # 如果这一层的 cos_sim > 0.75 → 必须 forward
+                    layer_must_forward = cos_sim > SKIP_THRESHOLD  # (B, L)
+                    active_mask = active_mask | layer_must_forward
+            
+            # 上一轮 skip 的 token 这轮必须算
+            if prev_skipped_indices is not None and len(prev_skipped_indices) > 0:
+                active_mask[:, prev_skipped_indices] = True
+            
+            # 记录被 skip 的 token 索引（下一轮必须算）
+            skipped_indices = (~active_mask[0]).nonzero(as_tuple=True)[0] if not active_mask[0].all() else None
+            
+            # 取所有 batch 的并集（简化实现）
+            any_active = active_mask.any(dim=0)  # (L,)
+            
+            if not any_active.all() and any_active.any():
+                # 有稳定的，也有不稳定的 → 只计算 active tokens
+                active_indices = any_active.nonzero(as_tuple=True)[0]
+                x_full = x.clone()
+                x = x[:, active_indices, :].clone()
+                
+                # 更新 replace_position：只标记 active 的位置
+                if replace_position is not None:
+                    new_replace = torch.zeros_like(replace_position)
+                    block_positions = replace_position[0].nonzero(as_tuple=True)[0]
+                    active_global = block_positions[active_indices]
+                    new_replace[:, active_global] = True
+                    replace_position = new_replace
+                    position_ids = active_global
+                else:
+                    position_ids = active_indices
+                    
+            elif not any_active.any():
+                # 全部稳定 → 完全跳过所有层
+                x_full = x.clone()
+                active_indices = torch.tensor([], dtype=torch.long, device=x.device)
 
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
@@ -1697,10 +1706,9 @@ class LLaDAModelLM(PreTrainedModel):
         return_dict: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        # Token Skip 参数（新版：基于最终 hidden state 判定）
-        skip_threshold: float = 0.95,
-        prev_final_hidden: Optional[torch.Tensor] = None,  # 上一 step 的最终 hidden state
-        prev_prev_final_hidden: Optional[torch.Tensor] = None,  # 上上一 step 的最终 hidden state
+        # Token Skip 参数（新版：基于最后四层 hidden state 判定，硬编码阈值 0.75）
+        prev_last4_hidden: Optional[List[torch.Tensor]] = None,  # 上一 step 的最后四层
+        prev_prev_last4_hidden: Optional[List[torch.Tensor]] = None,  # 上上一 step 的最后四层
         current_step: int = None,
         prev_skipped_indices: Optional[torch.Tensor] = None,
         force_full_every_k: int = 3,
@@ -1723,9 +1731,8 @@ class LLaDAModelLM(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             replace_position=replace_position,
             position_ids=position_ids,
-            skip_threshold=skip_threshold,
-            prev_final_hidden=prev_final_hidden,
-            prev_prev_final_hidden=prev_prev_final_hidden,
+            prev_last4_hidden=prev_last4_hidden,
+            prev_prev_last4_hidden=prev_prev_last4_hidden,
             current_step=current_step,
             prev_skipped_indices=prev_skipped_indices,
             force_full_every_k=force_full_every_k,
