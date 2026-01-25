@@ -294,7 +294,8 @@ def generate_with_dual_cache_tokenskip(
 
         # ==================== Step 1 ~ N：迭代 refinement ====================
         
-        prev_hidden = None  # 用于 Token Skip 判定
+        prev_hidden = None  # 用于 Token Skip 判定（Step 1 不做 skip，从 Step 2 开始）
+        prev_skipped_indices = None  # 上一轮被 skip 的 token 索引
         
         for i in range(1, steps_per_block):
             # 提前退出：如果当前 block 已经没有 [MASK] 了，就不用继续了
@@ -312,9 +313,12 @@ def generate_with_dual_cache_tokenskip(
                 skip_threshold=skip_threshold,
                 skip_outlier=skip_outlier,
                 prev_hidden=prev_hidden,
+                current_step=i,  # 当前 step，用于每隔 3 步强制全算
+                prev_skipped_indices=prev_skipped_indices,  # 上一轮 skip 的 token，这轮必须算
             )
             logits_blk = out_blk.logits
             prev_hidden = out_blk.hidden_states  # 保存供下一 step 判定
+            prev_skipped_indices = getattr(out_blk, 'skipped_indices', None)  # 保存这轮 skip 的索引
 
             # 找出当前 block 中哪些位置还是 [MASK]
             mask_blk = (x[:, s:e] == mask_id)
