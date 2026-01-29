@@ -33,7 +33,7 @@ from lm_eval.api.registry import register_model
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from generate import generate, generate_with_prefix_cache, generate_with_dual_cache
+from generate import generate, generate_with_prefix_cache, generate_with_dual_cache, generate_with_layer_skip
 from model.modeling_llada import LLaDAModelLM
 import json
 import time
@@ -67,6 +67,8 @@ class LLaDAEvalHarness(LM):
         save_dir=None,
         show_speed=False,
         dual_cache=False,
+        layer_skip=False,
+        layer_skip_threshold=0.99,
         **kwargs,
     ):
         '''
@@ -132,6 +134,8 @@ class LLaDAEvalHarness(LM):
         self.save_dir = save_dir
         self.show_speed = show_speed
         self.dual_cache = dual_cache
+        self.layer_skip = layer_skip
+        self.layer_skip_threshold = layer_skip_threshold
     @property
     def rank(self):
         return self._rank
@@ -303,6 +307,8 @@ class LLaDAEvalHarness(LM):
             batched_requests.pop()
 
         start_time = time.time()
+        total_layers_computed = 0
+        total_layers_skipped = 0
 
         for batch in tqdm(batched_requests, desc="Generating..."):
             batched_input_ids = []
@@ -336,8 +342,17 @@ class LLaDAEvalHarness(LM):
 
             stop_tokens = req.args[1]['until']
             input_ids = batched_input_ids
+            skip_stats = None
             if self.use_cache:
-                if self.dual_cache:
+                if self.layer_skip:
+                    # Layer skip: 基于 dual_cache 的层跳过优化
+                    generated_answer, nfe, skip_stats = generate_with_layer_skip(
+                        self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length,
+                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                        layer_skip_threshold=self.layer_skip_threshold)
+                    total_layers_computed += skip_stats['total_layers_computed']
+                    total_layers_skipped += skip_stats['total_layers_skipped']
+                elif self.dual_cache:
                     generated_answer, nfe = generate_with_dual_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
                 else:
@@ -382,6 +397,8 @@ class LLaDAEvalHarness(LM):
                 print('answer: ', batched_generated_answer[i])
                 print('nfe: ', nfe)
                 print('avg nfe: ', num_nfe / len(output))
+                if skip_stats is not None:
+                    print(f"layer_skip_stats: computed={skip_stats['total_layers_computed']}, skipped={skip_stats['total_layers_skipped']}, skip_rate={skip_stats['skip_rate']*100:.2f}%")
                 print('=' * 20, end='\n\n')
             # self.accelerator.wait_for_everyone()
         end_time = time.time()
@@ -390,6 +407,10 @@ class LLaDAEvalHarness(LM):
             print(f"Total time taken: {end_time - start_time} seconds")
             print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
             print(f"Total NFE is {num_nfe}")
+            if self.layer_skip:
+                total = total_layers_computed + total_layers_skipped
+                skip_rate = total_layers_skipped / total if total > 0 else 0
+                print(f"Layer Skip Stats: computed={total_layers_computed}, skipped={total_layers_skipped}, skip_rate={skip_rate*100:.2f}%")
             
         return output
 
