@@ -62,6 +62,42 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
     return num_transfer_tokens
 
 
+# =============================================================================
+# 占位函数：原始 LLaDA 的 generate 函数（当前实验不使用）
+# =============================================================================
+
+@torch.no_grad()
+def generate(
+    model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
+    remasking="low_confidence", mask_id=126336, threshold=None, factor=None
+):
+    """
+    占位函数：基础 generate（无缓存优化）。
+    当前实验使用 layer_skip 模式，不会调用此函数。
+    如需使用，请从原始 LLaDA 仓库获取实现。
+    """
+    raise NotImplementedError(
+        "generate() 函数未实现。当前实验请使用 use_cache=True 模式。"
+        "如需基础版本，请从 https://github.com/ML-GSAI/LLaDA 获取。"
+    )
+
+
+@torch.no_grad()
+def generate_with_prefix_cache(
+    model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
+    remasking="low_confidence", mask_id=126336, threshold=None, factor=None
+):
+    """
+    占位函数：带 prefix cache 的 generate。
+    当前实验使用 layer_skip 模式，不会调用此函数。
+    如需使用，请从原始 LLaDA 仓库获取实现。
+    """
+    raise NotImplementedError(
+        "generate_with_prefix_cache() 函数未实现。"
+        "当前实验请使用 layer_skip=True 或 dual_cache=True 模式。"
+        "如需此版本，请从 https://github.com/ML-GSAI/LLaDA 获取。"
+    )
+
 
 @torch.no_grad()
 def generate_with_dual_cache(
