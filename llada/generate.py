@@ -377,9 +377,9 @@ def generate_with_layer_skip(
                 break
             
             # 根据上一步的相似度决定跳过哪些层
-            # 只在 layer 1-28 范围内判断跳过（layer 0 和 29-31 不跳过）
+            # layer 0 不跳过（第一层），后8层不跳过（保证输出质量）
             skip_layers = set()
-            for layer_idx in range(1, min(29, n_layers)):  # layer 1-28
+            for layer_idx in range(1, n_layers - 8):  # layer 1 到 n_layers-9
                 prev_layer = layer_idx - 1
                 # 条件：前一层相似度高 且 上一步没跳过当前层
                 if (prev_layer in last_step_io_sim and 
