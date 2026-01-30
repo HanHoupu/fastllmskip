@@ -292,15 +292,15 @@ def generate_with_dual_cache_tokenskip(
 
         # ==================== Step 1 ~ N：迭代 refinement ====================
         
-        # Token Skip 状态（新版：基于最后四层 hidden state 判定）
+        # Token Skip 状态（新版：基于最后八层 hidden state 判定）
         # 需要 h_{t-1} 和 h_{t-2} 来判定，所以 Step 0, 1 不 skip，从 Step 2 开始
-        prev_last4_hidden = None      # h_{t-1}: 上一 step 的最后四层 hidden state
-        prev_prev_last4_hidden = None # h_{t-2}: 上上一 step 的最后四层 hidden state
+        prev_last4_hidden = None      # h_{t-1}: 上一 step 的最后八层 hidden state
+        prev_prev_last4_hidden = None # h_{t-2}: 上上一 step 的最后八层 hidden state
         prev_skipped_indices = None   # 上一轮被 skip 的 token 索引
         
-        # 从 Step 0 的输出中获取最后四层
-        if out_full.hidden_states is not None and len(out_full.hidden_states) >= 4:
-            prev_last4_hidden = out_full.hidden_states[-4:]  # 最后四层
+        # 从 Step 0 的输出中获取最后八层
+        if out_full.hidden_states is not None and len(out_full.hidden_states) >= 8:
+            prev_last4_hidden = out_full.hidden_states[-8:]  # 最后八层
         
         for i in range(1, steps_per_block):
             # 提前退出：如果当前 block 已经没有 [MASK] 了，就不用继续了
@@ -322,10 +322,10 @@ def generate_with_dual_cache_tokenskip(
             )
             logits_blk = out_blk.logits
             
-            # 更新 hidden state 历史（保存最后四层）
-            if out_blk.hidden_states is not None and len(out_blk.hidden_states) >= 4:
+            # 更新 hidden state 历史（保存最后八层）
+            if out_blk.hidden_states is not None and len(out_blk.hidden_states) >= 8:
                 prev_prev_last4_hidden = prev_last4_hidden  # h_{t-2} = 旧的 h_{t-1}
-                prev_last4_hidden = out_blk.hidden_states[-4:]  # h_{t-1} = 当前最后四层
+                prev_last4_hidden = out_blk.hidden_states[-8:]  # h_{t-1} = 当前最后八层
             prev_skipped_indices = getattr(out_blk, 'skipped_indices', None)
 
             # 找出当前 block 中哪些位置还是 [MASK]
@@ -353,6 +353,165 @@ def generate_with_dual_cache_tokenskip(
     # x: 完整的输出序列，形状 (B, Lp + gen_length)
     # nfe: 总共的前向传播次数
     return x, nfe
+
+@torch.no_grad()
+def generate_with_dual_cache_early_exit(
+    model,
+    prompt,
+    steps=128,
+    gen_length=128,
+    block_length=128,
+    temperature=0.,
+    remasking="low_confidence",
+    mask_id=126336,
+    threshold=None,
+    factor=None,
+    # Early Exit 参数（方案A）
+    early_exit_layer=16,      # 在第几层后判定（0-indexed，16表示前16层后）
+    early_exit_threshold=1.0, # cos_sim 阈值，>= 此值的 token 复用上一步结果（1.0=不skip，退化为baseline）
+    force_full_every_k=4,     # 每 K 步强制全算（threshold=1.0），0 表示禁用
+):
+    """
+    方案A: Early Exit Token Skip
+    
+    原理：
+    1. 前 early_exit_layer 层正常计算所有 token
+    2. 第 early_exit_layer 层后，比较当前 h 与上一 step 同层的 h
+    3. 如果 cos_sim >= early_exit_threshold，后续层的 FFN 输出复用上一 step 的结果
+    4. Attention 仍然全算（因为需要看到所有 token）
+    
+    额外保护：
+    - 上一轮 skip 的 token 这轮必须重算（防止误差累积）
+    - 每 force_full_every_k 步强制 threshold=1.0（全算）
+    
+    Sanity Check:
+    - early_exit_threshold=1.0 时，没有 token 会被 skip，退化为 generate_with_dual_cache
+    """
+    B = prompt.shape[0]
+    Lp = int(prompt.shape[1])
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+    assert steps % num_blocks == 0
+    steps_per_block = steps // num_blocks
+
+    x = torch.full((B, Lp + gen_length), mask_id, dtype=torch.long, device=model.device)
+    x[:, :Lp] = prompt
+
+    nfe = 0
+    
+    # Early Exit 统计
+    total_skipped_tokens = 0
+    total_tokens = 0
+
+    for nb in range(num_blocks):
+        s = Lp + nb * block_length
+        e = s + block_length
+
+        block_mask_index = (x[:, s:e] == mask_id)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+        # Step 0: 完整 forward，预热 KV cache
+        out_full = model(x, use_cache=True, output_hidden_states=True)
+        past_key_values = out_full.past_key_values
+        nfe += 1
+
+        replace_position = torch.zeros_like(x, dtype=torch.bool)
+        replace_position[:, s:e] = True
+
+        global_mask_index = (x == mask_id)
+        global_mask_index[:, e:] = False
+
+        if factor is None:
+            quota0 = None if threshold is not None else num_transfer_tokens[:, 0]
+            x0, transfer_index = get_transfer_index(
+                out_full.logits, temperature, remasking, global_mask_index, x, quota0, threshold
+            )
+        else:
+            x0, transfer_index = get_transfer_index_dynamic(
+                out_full.logits, temperature, remasking, global_mask_index, x, None, factor
+            )
+
+        x = torch.where(transfer_index, x0, x)
+
+        # 保存上一步的 hidden states（用于 early exit 判定和复用）
+        # hidden_states 是 tuple，长度 = n_layers + 1（包含 embedding 层后的输出）
+        prev_hidden_states = out_full.hidden_states  # tuple of (B, L, d_model)
+        
+        # 追踪上一轮 skip 的 token 索引（这轮必须重算）
+        prev_skipped_indices = None
+
+        # 迭代 refinement
+        for i in range(1, steps_per_block):
+            if (x[:, s:e] == mask_id).sum() == 0:
+                break
+            
+            # 判断是否强制全算（每 K 步）
+            force_full_this_step = (force_full_every_k > 0 and i % force_full_every_k == 0)
+            current_threshold = 1.0 if force_full_this_step else early_exit_threshold
+
+            # 带 early exit 的 forward
+            out_blk = model(
+                x[:, s:e],
+                past_key_values=past_key_values,
+                use_cache=True,
+                replace_position=replace_position,
+                output_hidden_states=True,
+                # Early Exit 参数
+                early_exit_layer=early_exit_layer,
+                early_exit_threshold=current_threshold,
+                prev_hidden_states=prev_hidden_states,
+                block_start_idx=s,  # 告诉模型当前 block 在全局序列中的起始位置
+                prev_skipped_indices=prev_skipped_indices,  # 上轮 skip 的，这轮必须算
+            )
+            logits_blk = out_blk.logits
+
+            # 统计 skip 数量（只统计非强制全算的 step）
+            if not force_full_this_step:
+                if hasattr(out_blk, 'num_skipped_tokens') and out_blk.num_skipped_tokens is not None:
+                    total_skipped_tokens += out_blk.num_skipped_tokens
+                    total_tokens += x[:, s:e].numel()
+            
+            # 更新 prev_skipped_indices：记录这轮被 skip 的 token（下轮必须算）
+            if hasattr(out_blk, 'skipped_indices'):
+                prev_skipped_indices = out_blk.skipped_indices
+
+            # 更新 prev_hidden_states：把 block 的 hidden states 合并回全局
+            if out_blk.hidden_states is not None and len(out_blk.hidden_states) > 0:
+                # out_blk.hidden_states 是 tuple，每个元素形状 (B, block_length, d_model)
+                # prev_hidden_states 是 tuple，每个元素形状 (B, full_length, d_model)
+                # 需要把 block 的结果放到对应位置
+                new_prev_hidden = []
+                for layer_idx, blk_h in enumerate(out_blk.hidden_states):
+                    if layer_idx < len(prev_hidden_states):
+                        full_h = prev_hidden_states[layer_idx].clone()
+                        full_h[:, s:e, :] = blk_h
+                        new_prev_hidden.append(full_h)
+                    else:
+                        new_prev_hidden.append(blk_h)
+                prev_hidden_states = tuple(new_prev_hidden)
+
+            mask_blk = (x[:, s:e] == mask_id)
+
+            if factor is None:
+                quota_i = None if threshold is not None else num_transfer_tokens[:, i]
+                x0_blk, transfer_idx_blk = get_transfer_index(
+                    logits_blk, temperature, remasking, mask_blk, x[:, s:e], quota_i, threshold
+                )
+            else:
+                x0_blk, transfer_idx_blk = get_transfer_index_dynamic(
+                    logits_blk, temperature, remasking, mask_blk, x[:, s:e], None, factor
+                )
+
+            blk_old = x[:, s:e]
+            blk_new = torch.where(transfer_idx_blk, x0_blk, blk_old)
+            x = torch.cat([x[:, :s], blk_new, x[:, e:]], dim=1)
+
+            nfe += 1
+
+    # 返回时附带 skip 统计
+    skip_ratio = total_skipped_tokens / max(total_tokens, 1)
+    return x, nfe, skip_ratio
+
 
 def get_transfer_index(
     logits: torch.Tensor,
