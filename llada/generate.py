@@ -209,6 +209,10 @@ def generate_with_dual_cache_tokenskip(
 
     # NFE = Number of Forward Evaluations（模型前向传播次数，用于统计计算量）
     nfe = 0
+    
+    # Token Skip 统计
+    total_skipped_tokens = 0
+    total_tokens = 0
 
     # ==================== 逐 Block 处理 ====================
     
@@ -326,6 +330,11 @@ def generate_with_dual_cache_tokenskip(
             )
             logits_blk = out_blk.logits
             
+            # 收集 Token Skip 统计
+            if hasattr(out_blk, 'num_skipped_tokens') and out_blk.num_skipped_tokens is not None:
+                total_skipped_tokens += out_blk.num_skipped_tokens
+            total_tokens += block_length  # 每个 step 处理 block_length 个 token
+            
             # 更新 hidden state 历史（保存后 skip_layers 层）
             if out_blk.hidden_states is not None and len(out_blk.hidden_states) >= skip_layers:
                 prev_prev_layers_hidden = prev_layers_hidden  # h_{t-2} = 旧的 h_{t-1}
@@ -356,7 +365,9 @@ def generate_with_dual_cache_tokenskip(
     # ==================== 返回结果 ====================
     # x: 完整的输出序列，形状 (B, Lp + gen_length)
     # nfe: 总共的前向传播次数
-    return x, nfe
+    # skip_ratio: 被 skip 的 token 比例
+    skip_ratio = total_skipped_tokens / max(total_tokens, 1)
+    return x, nfe, skip_ratio
 
 @torch.no_grad()
 def generate_with_dual_cache_early_exit(

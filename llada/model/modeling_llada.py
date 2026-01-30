@@ -1552,7 +1552,11 @@ class LLaDAModel(nn.Module):
             if not any_active.all() and any_active.any():
                 # 有稳定的，也有不稳定的 → 只计算 active tokens
                 active_indices = any_active.nonzero(as_tuple=True)[0]
-                x_full = x.clone()
+                skipped_token_indices = (~any_active).nonzero(as_tuple=True)[0]
+                
+                # 关键修复：被 skip 的 token 应使用 T-1 的最终 hidden state，不是原始 embedding
+                # prev_layers_hidden[-1] 是 T-1 的最后一层输出（最终 hidden state）
+                x_full = prev_layers_hidden[-1][:, offset:offset+L, :].clone()  # 用 T-1 的最终 hidden state
                 x = x[:, active_indices, :].clone()
                 
                 # 更新 replace_position：只标记 active 的位置
@@ -1567,8 +1571,8 @@ class LLaDAModel(nn.Module):
                     position_ids = active_indices
                     
             elif not any_active.any():
-                # 全部稳定 → 完全跳过所有层
-                x_full = x.clone()
+                # 全部稳定 → 完全跳过所有层，直接使用 T-1 的最终 hidden state
+                x_full = prev_layers_hidden[-1][:, offset:offset+L, :].clone()  # 用 T-1 的最终 hidden state
                 active_indices = torch.tensor([], dtype=torch.long, device=x.device)
 
         # Apply blocks one-by-one.
@@ -1578,9 +1582,17 @@ class LLaDAModel(nn.Module):
             # 如果全部稳定，跳过所有层
             skip_all_layers = active_indices is not None and len(active_indices) == 0
             
+            # ===== 统计 History-skip 跳过的 token 数 =====
+            # 在 History-skip 中，skipped_indices 已经记录了被 skip 的 token 索引
+            num_skipped_tokens = 0
+            if skipped_indices is not None and len(skipped_indices) > 0:
+                num_skipped_tokens = len(skipped_indices)
+            elif skip_all_layers:
+                # 全部稳定
+                num_skipped_tokens = orig_seq_len
+            
             # ===== Early Exit（方案A）状态 =====
             early_exit_stable_mask = None  # (B, L) bool，标记哪些 token 稳定
-            num_skipped_tokens = 0  # 统计跳过的 token 数
             
             for block_idx in range(num_layers):
                 block = self.transformer.blocks[block_idx]

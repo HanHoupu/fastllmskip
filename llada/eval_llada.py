@@ -202,19 +202,21 @@ class LLaDAEvalHarness(LM):
         self.show_speed = show_speed  # 速度统计
         self.dual_cache = dual_cache  # 是否用 dual cache
         
-        # Token Skip 参数（新版：基于最后四层 hidden state 判定，硬编码阈值 0.75）
+        # Token Skip 参数（History-skip：基于 T-2 vs T-1 后 N 层 hidden state 判定）
         # 注意：从命令行传入的参数都是字符串，需要转换
         token_skip_raw = kwargs.get('token_skip', 'False')
         self.token_skip = str(token_skip_raw).lower() in ('true', '1', 'yes')  # 是否启用 Token Skip
+        self.skip_threshold = float(kwargs.get('skip_threshold', 0.99))  # cos_sim 阈值
+        self.skip_layers = int(kwargs.get('skip_layers', 8))  # 使用后 N 层进行判定
         self.force_full_every_k = int(kwargs.get('force_full_every_k', 3))  # 每 K 步强制全算
         
-        # Early Exit 参数（方案A：基于前 early_exit_layer 层的 cos_sim 判定）
+        # Early Exit 参数（Early-step skip：基于 T vs T-1 前 K 层的 cos_sim 判定）
         early_exit_raw = kwargs.get('early_exit', 'False')
         self.early_exit = str(early_exit_raw).lower() in ('true', '1', 'yes')  # 是否启用 Early Exit
         self.early_exit_layer = int(kwargs.get('early_exit_layer', 16))  # 在第几层后判定
         self.early_exit_threshold = float(kwargs.get('early_exit_threshold', 1.0))  # cos_sim 阈值
         
-        print(f"[Token Skip] enabled={self.token_skip}, threshold=0.75 (hardcoded), force_full_every_k={self.force_full_every_k}")
+        print(f"[Token Skip] enabled={self.token_skip}, threshold={self.skip_threshold}, layers={self.skip_layers}, force_full_every_k={self.force_full_every_k}")
         print(f"[Early Exit] enabled={self.early_exit}, layer={self.early_exit_layer}, threshold={self.early_exit_threshold}")
     # ==================== 分布式相关属性 ====================
     
@@ -584,6 +586,8 @@ class LLaDAEvalHarness(LM):
         output = []  # 存储生成结果
         num_tokens = 0  # 统计生成的 token 数（用于速度计算）
         num_nfe = 0  # 统计 NFE（模型前向次数）
+        total_skip_ratio = 0.0  # 累积 skip ratio（用于平均值计算）
+        skip_ratio_count = 0  # skip ratio 样本数
         processed_count = 0  # 已处理数量（断点续跑用）
         
         # ==================== 断点续跑：加载已有结果 ====================
@@ -674,10 +678,11 @@ class LLaDAEvalHarness(LM):
             # ---------- 调用生成函数 ----------
             input_ids = batched_input_ids
             
+            skip_ratio = 0.0  # 默认无 skip
             if self.use_cache:
                 if self.dual_cache and self.token_skip:
-                    # 使用 Dual Cache + Token Skip 生成（基于最后四层，硬编码阈值 0.75）
-                    generated_answer, nfe = generate_with_dual_cache_tokenskip(
+                    # 使用 Dual Cache + Token Skip 生成（History-skip：T-2 vs T-1）
+                    generated_answer, nfe, skip_ratio = generate_with_dual_cache_tokenskip(
                         self.model, input_ids, 
                         steps=self.steps, 
                         gen_length=self.gen_length, 
@@ -688,7 +693,11 @@ class LLaDAEvalHarness(LM):
                         threshold=self.threshold, 
                         factor=self.factor,
                         force_full_every_k=self.force_full_every_k,
+                        skip_threshold=self.skip_threshold,
+                        skip_layers=self.skip_layers,
                     )
+                    total_skip_ratio += skip_ratio
+                    skip_ratio_count += 1
                 elif self.dual_cache and self.early_exit:
                     # 使用 Dual Cache + Early Exit 生成（方案A）
                     generated_answer, nfe, skip_ratio = generate_with_dual_cache_early_exit(
@@ -705,6 +714,8 @@ class LLaDAEvalHarness(LM):
                         early_exit_threshold=self.early_exit_threshold,
                         force_full_every_k=self.force_full_every_k,
                     )
+                    total_skip_ratio += skip_ratio
+                    skip_ratio_count += 1
                 elif self.dual_cache:
                     # 使用 Dual Cache 生成（不带 Token Skip）
                     generated_answer, nfe = generate_with_dual_cache(
@@ -796,6 +807,10 @@ class LLaDAEvalHarness(LM):
             print(f"Total time taken: {end_time - start_time} seconds")
             print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
             print(f"Total NFE is {num_nfe}")
+            # Token Skip / Early Exit 统计
+            if skip_ratio_count > 0:
+                avg_skip_ratio = total_skip_ratio / skip_ratio_count
+                print(f"Token Skip Stats: skip_rate={avg_skip_ratio*100:.2f}%")
             
         return output
 
