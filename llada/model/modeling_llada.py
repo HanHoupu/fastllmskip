@@ -1351,13 +1351,15 @@ class LLaDAModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,  # 支持不连续位置
-        # Token Skip 参数（新版：基于最后八层 hidden state 判定）
-        # 硬编码阈值 0.75：如果八层中任意一层 cos_sim > 0.75 → 必须 forward
-        prev_last4_hidden: Optional[List[torch.Tensor]] = None,  # 上一 step 的最后八层 hidden state
-        prev_prev_last4_hidden: Optional[List[torch.Tensor]] = None,  # 上上一 step 的最后八层
+        # Token Skip 参数（基于后 N 层 hidden state 判定）
+        # 比较 T-2 和 T-1 的 cos_sim，如果所有层都 >= skip_threshold → 可以 skip
+        prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # 上一 step (T-1) 的后 N 层 hidden state
+        prev_prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # 上上一 step (T-2) 的后 N 层
         current_step: int = None,       # 当前 step
         prev_skipped_indices: Optional[torch.Tensor] = None,  # 上一轮 skip 的 token 索引（这轮必须算）
         force_full_every_k: int = 3,    # 每 K 步强制全部重算（0 表示禁用）
+        skip_threshold: float = 0.99,   # cos_sim 阈值，>= 此值认为稳定可以 skip
+        skip_layers: int = 16,          # 使用后 N 层进行判定
         # Early Exit 参数（方案A）
         early_exit_layer: int = None,   # 在第几层后判定（None=禁用）
         early_exit_threshold: float = 1.0,  # cos_sim 阈值
@@ -1478,11 +1480,10 @@ class LLaDAModel(nn.Module):
         # decoder layers
         all_hidden_states = []
         
-        # ===== Token Skip（新版）：基于最后八层 hidden state 判定 =====
-        # 硬编码阈值 0.75
-        # 判定：如果八层中任意一层 cos_sim > 0.75 → 必须 forward（不 skip）
-        # 只有八层的 cos_sim 都 <= 0.75 时，才 skip
-        SKIP_THRESHOLD = 0.75  # 硬编码阈值
+        # ===== Token Skip：基于后 skip_layers 层 hidden state 判定 =====
+        # 比较 T-2 和 T-1 的 cos_sim
+        # 判定：如果后 N 层中**所有层** cos_sim >= skip_threshold → 可以 skip（稳定）
+        #       如果**任意一层** cos_sim < skip_threshold → 必须 forward（不稳定）
         
         active_indices = None
         orig_seq_len = x.shape[1]
@@ -1491,11 +1492,11 @@ class LLaDAModel(nn.Module):
         orig_replace_position = replace_position  # 保存原始的 replace_position
         orig_position_ids = position_ids
         
-        # 判定是否启用 skip（需要两个 step 的最后八层都存在）
-        skip_enabled = (prev_last4_hidden is not None and 
-                        prev_prev_last4_hidden is not None and
-                        len(prev_last4_hidden) == 8 and 
-                        len(prev_prev_last4_hidden) == 8)
+        # 判定是否启用 skip（需要两个 step 的后 N 层都存在）
+        skip_enabled = (prev_layers_hidden is not None and 
+                        prev_prev_layers_hidden is not None and
+                        len(prev_layers_hidden) == skip_layers and 
+                        len(prev_prev_layers_hidden) == skip_layers)
         
         # 强制全算的条件
         force_full = (force_full_every_k > 0 and 
@@ -1506,8 +1507,8 @@ class LLaDAModel(nn.Module):
             B, L, _ = x.shape
             
             # 处理维度对齐（prev 可能是完整序列，当前只是 block）
-            prev_seq_len = prev_last4_hidden[0].shape[1]
-            prev_prev_seq_len = prev_prev_last4_hidden[0].shape[1]
+            prev_seq_len = prev_layers_hidden[0].shape[1]
+            prev_prev_seq_len = prev_prev_layers_hidden[0].shape[1]
             
             # 计算 offset：当前 block 在全局序列中的起始位置
             if prev_seq_len > L and replace_position is not None:
@@ -1516,25 +1517,27 @@ class LLaDAModel(nn.Module):
             else:
                 offset = 0
             
-            # 对八层分别计算 cos_sim，检查是否有任意一层 > 0.75
-            # 如果有 → active（必须 forward）
-            # 如果八层都 <= 0.75 → 可以 skip
-            active_mask = torch.zeros(B, L, dtype=torch.bool, device=x.device)
+            # 对后 N 层分别计算 cos_sim，检查是否有任意一层 < skip_threshold
+            # 初始化为 True（假设全部可以 skip），任意一层不满足就设为 False
+            can_skip_mask = torch.ones(B, L, dtype=torch.bool, device=x.device)
             
-            for layer_idx in range(8):
-                h_t1 = prev_last4_hidden[layer_idx][:, offset:offset+L, :]  # (B, L, d)
-                h_t2_full = prev_prev_last4_hidden[layer_idx]
-                h_t2 = h_t2_full[:, offset:offset+L, :] if prev_prev_seq_len > L else h_t2_full  # (B, L, d)
+            for layer_idx in range(skip_layers):
+                h_t1 = prev_layers_hidden[layer_idx][:, offset:offset+L, :]  # T-1 的 hidden (B, L, d)
+                h_t2_full = prev_prev_layers_hidden[layer_idx]
+                h_t2 = h_t2_full[:, offset:offset+L, :] if prev_prev_seq_len > L else h_t2_full  # T-2 的 hidden (B, L, d)
                 
                 # 确保维度匹配
                 if h_t1.shape[1] == L and h_t2.shape[1] == L:
-                    # 计算 cos_sim
+                    # 计算 cos_sim(T-2, T-1)
                     cos_sim = F.cosine_similarity(h_t1.float(), h_t2.float(), dim=-1)  # (B, L)
                     cos_sim = cos_sim.clamp(-1.0, 1.0)
                     
-                    # 如果这一层的 cos_sim > 0.75 → 必须 forward
-                    layer_must_forward = cos_sim > SKIP_THRESHOLD  # (B, L)
-                    active_mask = active_mask | layer_must_forward
+                    # 如果这一层的 cos_sim < skip_threshold → 不能 skip（必须 forward）
+                    layer_unstable = cos_sim < skip_threshold  # (B, L)
+                    can_skip_mask = can_skip_mask & (~layer_unstable)  # 任意一层不稳定就不能 skip
+            
+            # active_mask = 必须 forward 的 token（即 ~can_skip_mask）
+            active_mask = ~can_skip_mask
             
             # 上一轮 skip 的 token 这轮必须算
             if prev_skipped_indices is not None and len(prev_skipped_indices) > 0:
@@ -1600,24 +1603,50 @@ class LLaDAModel(nn.Module):
 
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
                 
-                # ===== Early Exit 判定（在 early_exit_layer 后） =====
+                # ===== Early Exit 判定（在 early_exit_layer 后，基于前16层的平均 cos_sim） =====
                 if (early_exit_layer is not None and 
                     block_idx == early_exit_layer and 
                     prev_hidden_states is not None and 
-                    len(prev_hidden_states) > early_exit_layer):
-                    # 比较当前 x 与上一 step 的同层 hidden state
-                    # prev_hidden_states 是 tuple，索引 0 是 embedding 后，索引 i+1 是第 i 层后
-                    prev_h = prev_hidden_states[early_exit_layer + 1]  # +1 因为索引 0 是 embedding
+                    len(prev_hidden_states) > early_exit_layer and
+                    len(all_hidden_states) >= early_exit_layer + 1):
+                    # 比较前16层的 cos_sim（包含当前层）
+                    # all_hidden_states: 索引 0 是 embedding 后，索引 i+1 是第 i 层后
+                    # prev_hidden_states: 同样结构，来自上一 step
                     
-                    # 处理维度：当前可能只是 block，prev 是完整序列
-                    if block_start_idx is not None and prev_h.shape[1] > x.shape[1]:
-                        prev_h_slice = prev_h[:, block_start_idx:block_start_idx + x.shape[1], :]
-                    else:
-                        prev_h_slice = prev_h
+                    cos_sims = []  # 存储每一层的 cos_sim
+                    min_cos_sim = None  # 记录最小 cos_sim
                     
-                    # 计算 cos_sim
-                    cos_sim = F.cosine_similarity(x.float(), prev_h_slice.float(), dim=-1)  # (B, L)
-                    early_exit_stable_mask = cos_sim >= early_exit_threshold  # (B, L)
+                    for layer_idx in range(early_exit_layer):  # 0 ~ early_exit_layer-1（前16层）
+                        # 当前层的 hidden state（已收集在 all_hidden_states 中）
+                        curr_h = all_hidden_states[layer_idx + 1]  # +1 因为索引 0 是 embedding
+                        prev_h = prev_hidden_states[layer_idx + 1]
+                        
+                        # 处理维度：当前可能只是 block，prev 是完整序列
+                        if block_start_idx is not None and prev_h.shape[1] > curr_h.shape[1]:
+                            prev_h_slice = prev_h[:, block_start_idx:block_start_idx + curr_h.shape[1], :]
+                        else:
+                            prev_h_slice = prev_h
+                        
+                        # 计算 cos_sim
+                        layer_cos_sim = F.cosine_similarity(curr_h.float(), prev_h_slice.float(), dim=-1)  # (B, L)
+                        cos_sims.append(layer_cos_sim)
+                        
+                        # 更新最小值
+                        if min_cos_sim is None:
+                            min_cos_sim = layer_cos_sim
+                        else:
+                            min_cos_sim = torch.min(min_cos_sim, layer_cos_sim)
+                    
+                    # 计算前16层的平均 cos_sim
+                    avg_cos_sim = torch.stack(cos_sims).mean(dim=0)  # (B, L)
+                    
+                    # 主判定：平均 cos_sim >= threshold
+                    early_exit_stable_mask = avg_cos_sim >= early_exit_threshold  # (B, L)
+                    
+                    # 保护机制：任意一层 cos_sim < 0.85 → 强制重算
+                    min_layer_threshold = 0.85
+                    unstable_by_min = min_cos_sim < min_layer_threshold  # (B, L)
+                    early_exit_stable_mask = early_exit_stable_mask & (~unstable_by_min)
                     
                     # 上轮 skip 的 token 这轮必须重算（不能被判定为稳定）
                     if prev_skipped_indices is not None and len(prev_skipped_indices) > 0:
@@ -1797,12 +1826,14 @@ class LLaDAModelLM(PreTrainedModel):
         return_dict: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        # Token Skip 参数（新版：基于最后八层 hidden state 判定，硬编码阈值 0.75）
-        prev_last4_hidden: Optional[List[torch.Tensor]] = None,  # 上一 step 的最后八层
-        prev_prev_last4_hidden: Optional[List[torch.Tensor]] = None,  # 上上一 step 的最后八层
+        # Token Skip 参数（基于后 N 层 hidden state 判定）
+        prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # 上一 step (T-1) 的后 N 层
+        prev_prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # 上上一 step (T-2) 的后 N 层
         current_step: int = None,
         prev_skipped_indices: Optional[torch.Tensor] = None,
         force_full_every_k: int = 3,
+        skip_threshold: float = 0.99,   # cos_sim 阈值，>= 此值认为稳定可以 skip
+        skip_layers: int = 16,          # 使用后 N 层进行判定
         # Early Exit 参数（方案A）
         early_exit_layer: int = None,
         early_exit_threshold: float = 1.0,
@@ -1827,11 +1858,13 @@ class LLaDAModelLM(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             replace_position=replace_position,
             position_ids=position_ids,
-            prev_last4_hidden=prev_last4_hidden,
-            prev_prev_last4_hidden=prev_prev_last4_hidden,
+            prev_layers_hidden=prev_layers_hidden,
+            prev_prev_layers_hidden=prev_prev_layers_hidden,
             current_step=current_step,
             prev_skipped_indices=prev_skipped_indices,
             force_full_every_k=force_full_every_k,
+            skip_threshold=skip_threshold,
+            skip_layers=skip_layers,
             early_exit_layer=early_exit_layer,
             early_exit_threshold=early_exit_threshold,
             prev_hidden_states=prev_hidden_states,

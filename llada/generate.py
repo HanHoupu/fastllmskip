@@ -161,8 +161,10 @@ def generate_with_dual_cache_tokenskip(
     mask_id=126336,  # [MASK] token 的 id
     threshold=None,  # 置信度阈值，超过这个值的 token 会被 unmask（并行解码模式）
     factor=None,     # 动态阈值因子（用于 get_transfer_index_dynamic）
-    # Token Skip 超参（新版：基于最后四层 hidden state，硬编码阈值 0.75）
-    force_full_every_k=3, # 每 K 步强制全部重算（0 表示禁用）
+    # Token Skip 超参
+    force_full_every_k=3,  # 每 K 步强制全部重算（0 表示禁用）
+    skip_threshold=0.99,   # cos_sim 阈值，>= 此值认为稳定可以 skip
+    skip_layers=16,        # 使用后 N 层进行判定（如 16 表示后 16 层）
 ):
     """
     使用 Dual Cache 的生成函数（你可以在这里添加 token skip 优化）
@@ -292,15 +294,15 @@ def generate_with_dual_cache_tokenskip(
 
         # ==================== Step 1 ~ N：迭代 refinement ====================
         
-        # Token Skip 状态（新版：基于最后八层 hidden state 判定）
+        # Token Skip 状态（基于后 skip_layers 层 hidden state 判定）
         # 需要 h_{t-1} 和 h_{t-2} 来判定，所以 Step 0, 1 不 skip，从 Step 2 开始
-        prev_last4_hidden = None      # h_{t-1}: 上一 step 的最后八层 hidden state
-        prev_prev_last4_hidden = None # h_{t-2}: 上上一 step 的最后八层 hidden state
-        prev_skipped_indices = None   # 上一轮被 skip 的 token 索引
+        prev_layers_hidden = None      # h_{t-1}: 上一 step 的后 N 层 hidden state
+        prev_prev_layers_hidden = None # h_{t-2}: 上上一 step 的后 N 层 hidden state
+        prev_skipped_indices = None    # 上一轮被 skip 的 token 索引
         
-        # 从 Step 0 的输出中获取最后八层
-        if out_full.hidden_states is not None and len(out_full.hidden_states) >= 8:
-            prev_last4_hidden = out_full.hidden_states[-8:]  # 最后八层
+        # 从 Step 0 的输出中获取后 skip_layers 层
+        if out_full.hidden_states is not None and len(out_full.hidden_states) >= skip_layers:
+            prev_layers_hidden = out_full.hidden_states[-skip_layers:]  # 后 N 层
         
         for i in range(1, steps_per_block):
             # 提前退出：如果当前 block 已经没有 [MASK] 了，就不用继续了
@@ -314,18 +316,20 @@ def generate_with_dual_cache_tokenskip(
                 use_cache=True,
                 replace_position=replace_position,
                 output_hidden_states=True,
-                prev_last4_hidden=prev_last4_hidden,
-                prev_prev_last4_hidden=prev_prev_last4_hidden,
+                prev_layers_hidden=prev_layers_hidden,
+                prev_prev_layers_hidden=prev_prev_layers_hidden,
                 current_step=i,
                 prev_skipped_indices=prev_skipped_indices,
                 force_full_every_k=force_full_every_k,
+                skip_threshold=skip_threshold,
+                skip_layers=skip_layers,
             )
             logits_blk = out_blk.logits
             
-            # 更新 hidden state 历史（保存最后八层）
-            if out_blk.hidden_states is not None and len(out_blk.hidden_states) >= 8:
-                prev_prev_last4_hidden = prev_last4_hidden  # h_{t-2} = 旧的 h_{t-1}
-                prev_last4_hidden = out_blk.hidden_states[-8:]  # h_{t-1} = 当前最后八层
+            # 更新 hidden state 历史（保存后 skip_layers 层）
+            if out_blk.hidden_states is not None and len(out_blk.hidden_states) >= skip_layers:
+                prev_prev_layers_hidden = prev_layers_hidden  # h_{t-2} = 旧的 h_{t-1}
+                prev_layers_hidden = out_blk.hidden_states[-skip_layers:]  # h_{t-1} = 后 N 层
             prev_skipped_indices = getattr(out_blk, 'skipped_indices', None)
 
             # 找出当前 block 中哪些位置还是 [MASK]

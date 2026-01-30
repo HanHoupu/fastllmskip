@@ -54,7 +54,7 @@ from lm_eval.api.registry import register_model  # 模型注册装饰器
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from generate import generate_with_dual_cache, generate_with_dual_cache_tokenskip
+from generate import generate_with_dual_cache, generate_with_dual_cache_tokenskip, generate_with_dual_cache_early_exit
 from model.modeling_llada import LLaDAModelLM
 import json
 import time
@@ -208,7 +208,14 @@ class LLaDAEvalHarness(LM):
         self.token_skip = str(token_skip_raw).lower() in ('true', '1', 'yes')  # 是否启用 Token Skip
         self.force_full_every_k = int(kwargs.get('force_full_every_k', 3))  # 每 K 步强制全算
         
+        # Early Exit 参数（方案A：基于前 early_exit_layer 层的 cos_sim 判定）
+        early_exit_raw = kwargs.get('early_exit', 'False')
+        self.early_exit = str(early_exit_raw).lower() in ('true', '1', 'yes')  # 是否启用 Early Exit
+        self.early_exit_layer = int(kwargs.get('early_exit_layer', 16))  # 在第几层后判定
+        self.early_exit_threshold = float(kwargs.get('early_exit_threshold', 1.0))  # cos_sim 阈值
+        
         print(f"[Token Skip] enabled={self.token_skip}, threshold=0.75 (hardcoded), force_full_every_k={self.force_full_every_k}")
+        print(f"[Early Exit] enabled={self.early_exit}, layer={self.early_exit_layer}, threshold={self.early_exit_threshold}")
     # ==================== 分布式相关属性 ====================
     
     @property
@@ -680,6 +687,22 @@ class LLaDAEvalHarness(LM):
                         mask_id=self.mask_id, 
                         threshold=self.threshold, 
                         factor=self.factor,
+                        force_full_every_k=self.force_full_every_k,
+                    )
+                elif self.dual_cache and self.early_exit:
+                    # 使用 Dual Cache + Early Exit 生成（方案A）
+                    generated_answer, nfe, skip_ratio = generate_with_dual_cache_early_exit(
+                        self.model, input_ids, 
+                        steps=self.steps, 
+                        gen_length=self.gen_length, 
+                        block_length=self.block_length, 
+                        temperature=0,  # 贪婪解码
+                        remasking=self.remasking, 
+                        mask_id=self.mask_id, 
+                        threshold=self.threshold, 
+                        factor=self.factor,
+                        early_exit_layer=self.early_exit_layer,
+                        early_exit_threshold=self.early_exit_threshold,
                         force_full_every_k=self.force_full_every_k,
                     )
                 elif self.dual_cache:
