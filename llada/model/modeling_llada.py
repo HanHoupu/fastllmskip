@@ -436,7 +436,7 @@ class RotaryEmbedding(nn.Module):
                 block_end_index: Optional[torch.Tensor] = None,
                 position_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        position_ids: 可选，形状 (query_len,)，指定每个 query token 的绝对位置（支持不连续）
+        position_ids: Optional, shape (query_len,), absolute position for each query token
         """
         if self.config.rope_full_precision:
             q_, k_ = q.float(), k.float()
@@ -447,7 +447,7 @@ class RotaryEmbedding(nn.Module):
             query_len, key_len = q_.shape[-2], k_.shape[-2]
             
             if position_ids is not None:
-                # TokenSkip: 用离散 position_ids 应用 RoPE
+                # TokenSkip: apply RoPE with discrete position_ids
                 max_pos = int(position_ids.max().item()) + 1
                 pos_sin, pos_cos = self.get_rotary_embedding(max_pos, q_.device)
                 pos_sin = pos_sin.type_as(q_)
@@ -460,7 +460,7 @@ class RotaryEmbedding(nn.Module):
                 q_ = self.apply_rotary_pos_emb(pos_sin_slice, pos_cos_slice, q_)
                 k_ = self.apply_rotary_pos_emb(pos_sin_slice, pos_cos_slice, k_)
             else:
-                # Baseline: 连续位置
+                # Baseline: continuous positions
                 pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
                 pos_sin = pos_sin.type_as(q_)
                 pos_cos = pos_cos.type_as(q_)
@@ -741,11 +741,11 @@ class LLaDABlock(nn.Module):
                 k = torch.cat((past_key, k), dim=-2)
                 v = torch.cat((past_value, v), dim=-2)
             else:
-                # Token Skip: 先对新的 k 应用 RoPE，再更新 cache
+                # Token Skip: apply RoPE to new k first, then update cache
                 if position_ids is not None and self.config.rope:
                     q, k = self.rotary_emb(q, k, position_ids=position_ids)
                 
-                # 更新 KV cache 的指定位置
+                # Update KV cache at specified positions
                 batch_size = replace_position.shape[0]
                 for batch_idx in range(batch_size):
                     batch_replace_indices = replace_position[batch_idx].nonzero(as_tuple=True)[0]
@@ -761,7 +761,7 @@ class LLaDABlock(nn.Module):
 
         if self.config.rope:
             if position_ids is not None:
-                # Token Skip: RoPE 已在上面应用
+                # Token Skip: RoPE already applied above
                 pass
             elif replace_position is None:
                 q, k = self.rotary_emb(q, k)
@@ -771,7 +771,7 @@ class LLaDABlock(nn.Module):
 
         if attention_bias is not None:
             if position_ids is not None:
-                # Token Skip: 用 position_ids 索引 attention_bias
+                # Token Skip: index attention_bias with position_ids
                 attention_bias = self._cast_attn_bias(
                     attention_bias[:, :, position_ids, :key_len], dtype
                 )
@@ -958,7 +958,7 @@ class LLaDALlamaBlock(LLaDABlock):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         replace_position: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,  # 新增：支持不连续位置
+        position_ids: Optional[torch.Tensor] = None,  # Support non-contiguous positions
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         x_normed = self.attn_norm(x)
@@ -1124,12 +1124,12 @@ class LLaDAOutput(NamedTuple):
     
     skipped_indices: Optional[torch.Tensor] = None
     """
-    Token Skip: 这一轮被 skip 的 token 索引（下一轮必须算）
+    Token Skip: skipped token indices this step (must compute next step)
     """
     
     num_skipped_tokens: int = 0
     """
-    Early Exit: 这一轮被 early exit 跳过的 token 数量
+    Early Exit: number of tokens skipped by early exit this step
     """
 
 
@@ -1350,21 +1350,20 @@ class LLaDAModel(nn.Module):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,  # 支持不连续位置
-        # Token Skip 参数（基于后 N 层 hidden state 判定）
-        # 比较 T-2 和 T-1 的 cos_sim，如果所有层都 >= skip_threshold → 可以 skip
-        prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # 上一 step (T-1) 的后 N 层 hidden state
-        prev_prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # 上上一 step (T-2) 的后 N 层
-        current_step: int = None,       # 当前 step
-        prev_skipped_indices: Optional[torch.Tensor] = None,  # 上一轮 skip 的 token 索引（这轮必须算）
-        force_full_every_k: int = 3,    # 每 K 步强制全部重算（0 表示禁用）
-        skip_threshold: float = 0.99,   # cos_sim 阈值，>= 此值认为稳定可以 skip
-        skip_layers: int = 16,          # 使用后 N 层进行判定
-        # Early Exit 参数（方案A）
-        early_exit_layer: int = None,   # 在第几层后判定（None=禁用）
-        early_exit_threshold: float = 1.0,  # cos_sim 阈值
-        prev_hidden_states: Optional[Tuple[torch.Tensor]] = None,  # 上一 step 的所有层 hidden states
-        block_start_idx: int = None,    # 当前 block 在全局序列中的起始位置
+        position_ids: Optional[torch.Tensor] = None,  # Support non-contiguous positions
+        # Token Skip params (based on last N layers hidden state)
+        prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # T-1 step's last N layers
+        prev_prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # T-2 step's last N layers
+        current_step: int = None,
+        prev_skipped_indices: Optional[torch.Tensor] = None,  # Skipped indices from last step
+        force_full_every_k: int = 3,    # Force full forward every K steps (0=disable)
+        skip_threshold: float = 0.99,   # cos_sim threshold for skip
+        skip_layers: int = 16,          # Number of layers for skip decision
+        # Early Exit params
+        early_exit_layer: int = None,   # Layer index for early exit (None=disable)
+        early_exit_threshold: float = 1.0,  # cos_sim threshold
+        prev_hidden_states: Optional[Tuple[torch.Tensor]] = None,  # Previous step hidden states
+        block_start_idx: int = None,    # Block start index in global sequence
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1480,25 +1479,23 @@ class LLaDAModel(nn.Module):
         # decoder layers
         all_hidden_states = []
         
-        # ===== Token Skip：基于后 skip_layers 层 hidden state 判定 =====
-        # 比较 T-2 和 T-1 的 cos_sim
-        # 判定：如果后 N 层中**所有层** cos_sim >= skip_threshold → 可以 skip（稳定）
-        #       如果**任意一层** cos_sim < skip_threshold → 必须 forward（不稳定）
+        # ===== Token Skip: based on last skip_layers layers =====
+        # Compare cos_sim(T-2, T-1): if all layers >= threshold -> skip (stable)
         
         active_indices = None
         orig_seq_len = x.shape[1]
-        x_full = None  # 保存完整的 x，用于合并
-        skipped_indices = None  # 记录被 skip 的 token 索引
-        orig_replace_position = replace_position  # 保存原始的 replace_position
+        x_full = None  # Full x for merging
+        skipped_indices = None  # Skipped token indices
+        orig_replace_position = replace_position  # Original replace_position
         orig_position_ids = position_ids
         
-        # 判定是否启用 skip（需要两个 step 的后 N 层都存在）
+        # Check if skip is enabled (need both T-1 and T-2 hidden states)
         skip_enabled = (prev_layers_hidden is not None and 
                         prev_prev_layers_hidden is not None and
                         len(prev_layers_hidden) == skip_layers and 
                         len(prev_prev_layers_hidden) == skip_layers)
         
-        # 强制全算的条件
+        # Force full forward condition
         force_full = (force_full_every_k > 0 and 
                       current_step is not None and 
                       current_step % force_full_every_k == 0)
@@ -1506,60 +1503,59 @@ class LLaDAModel(nn.Module):
         if skip_enabled and not force_full:
             B, L, _ = x.shape
             
-            # 处理维度对齐（prev 可能是完整序列，当前只是 block）
+            # Handle dimension alignment (prev may be full seq, current is block)
             prev_seq_len = prev_layers_hidden[0].shape[1]
             prev_prev_seq_len = prev_prev_layers_hidden[0].shape[1]
             
-            # 计算 offset：当前 block 在全局序列中的起始位置
+            # Calculate offset: block start position in global sequence
             if prev_seq_len > L and replace_position is not None:
                 block_start = replace_position[0].nonzero(as_tuple=True)[0][0].item()
                 offset = block_start
             else:
                 offset = 0
             
-            # 对后 N 层分别计算 cos_sim，检查是否有任意一层 < skip_threshold
-            # 初始化为 True（假设全部可以 skip），任意一层不满足就设为 False
+            # Check cos_sim for last N layers, any layer < threshold -> cannot skip
+            # Init True (assume all can skip), set False if any layer unstable
             can_skip_mask = torch.ones(B, L, dtype=torch.bool, device=x.device)
             
             for layer_idx in range(skip_layers):
-                h_t1 = prev_layers_hidden[layer_idx][:, offset:offset+L, :]  # T-1 的 hidden (B, L, d)
+                h_t1 = prev_layers_hidden[layer_idx][:, offset:offset+L, :]  # T-1 hidden (B, L, d)
                 h_t2_full = prev_prev_layers_hidden[layer_idx]
-                h_t2 = h_t2_full[:, offset:offset+L, :] if prev_prev_seq_len > L else h_t2_full  # T-2 的 hidden (B, L, d)
+                h_t2 = h_t2_full[:, offset:offset+L, :] if prev_prev_seq_len > L else h_t2_full  # T-2 hidden (B, L, d)
                 
-                # 确保维度匹配
+                # Ensure dimension match
                 if h_t1.shape[1] == L and h_t2.shape[1] == L:
-                    # 计算 cos_sim(T-2, T-1)
+                    # Compute cos_sim(T-2, T-1)
                     cos_sim = F.cosine_similarity(h_t1.float(), h_t2.float(), dim=-1)  # (B, L)
                     cos_sim = cos_sim.clamp(-1.0, 1.0)
                     
-                    # 如果这一层的 cos_sim < skip_threshold → 不能 skip（必须 forward）
+                    # If this layer's cos_sim < threshold -> cannot skip
                     layer_unstable = cos_sim < skip_threshold  # (B, L)
-                    can_skip_mask = can_skip_mask & (~layer_unstable)  # 任意一层不稳定就不能 skip
+                    can_skip_mask = can_skip_mask & (~layer_unstable)  # Any unstable layer -> cannot skip
             
-            # active_mask = 必须 forward 的 token（即 ~can_skip_mask）
+            # active_mask = tokens that must forward (~can_skip_mask)
             active_mask = ~can_skip_mask
             
-            # 上一轮 skip 的 token 这轮必须算
+            # Tokens skipped last step must be computed this step
             if prev_skipped_indices is not None and len(prev_skipped_indices) > 0:
                 active_mask[:, prev_skipped_indices] = True
             
-            # 记录被 skip 的 token 索引（下一轮必须算）
+            # Record skipped indices (must compute next step)
             skipped_indices = (~active_mask[0]).nonzero(as_tuple=True)[0] if not active_mask[0].all() else None
             
-            # 取所有 batch 的并集（简化实现）
+            # Union across all batches (simplified)
             any_active = active_mask.any(dim=0)  # (L,)
             
             if not any_active.all() and any_active.any():
-                # 有稳定的，也有不稳定的 → 只计算 active tokens
+                # Mix of stable/unstable -> only compute active tokens
                 active_indices = any_active.nonzero(as_tuple=True)[0]
                 skipped_token_indices = (~any_active).nonzero(as_tuple=True)[0]
                 
-                # 关键修复：被 skip 的 token 应使用 T-1 的最终 hidden state，不是原始 embedding
-                # prev_layers_hidden[-1] 是 T-1 的最后一层输出（最终 hidden state）
-                x_full = prev_layers_hidden[-1][:, offset:offset+L, :].clone()  # 用 T-1 的最终 hidden state
+                # Skipped tokens use T-1's final hidden state
+                x_full = prev_layers_hidden[-1][:, offset:offset+L, :].clone()
                 x = x[:, active_indices, :].clone()
                 
-                # 更新 replace_position：只标记 active 的位置
+                # Update replace_position: only mark active positions
                 if replace_position is not None:
                     new_replace = torch.zeros_like(replace_position)
                     block_positions = replace_position[0].nonzero(as_tuple=True)[0]
@@ -1571,33 +1567,32 @@ class LLaDAModel(nn.Module):
                     position_ids = active_indices
                     
             elif not any_active.any():
-                # 全部稳定 → 完全跳过所有层，直接使用 T-1 的最终 hidden state
-                x_full = prev_layers_hidden[-1][:, offset:offset+L, :].clone()  # 用 T-1 的最终 hidden state
+                # All stable -> skip all layers, use T-1's final hidden state
+                x_full = prev_layers_hidden[-1][:, offset:offset+L, :].clone()
                 active_indices = torch.tensor([], dtype=torch.long, device=x.device)
 
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
             num_layers = len(self.transformer.blocks)
             
-            # 如果全部稳定，跳过所有层
+            # If all stable, skip all layers
             skip_all_layers = active_indices is not None and len(active_indices) == 0
             
-            # ===== 统计 History-skip 跳过的 token 数 =====
-            # 在 History-skip 中，skipped_indices 已经记录了被 skip 的 token 索引
+            # ===== Count skipped tokens =====
             num_skipped_tokens = 0
             if skipped_indices is not None and len(skipped_indices) > 0:
                 num_skipped_tokens = len(skipped_indices)
             elif skip_all_layers:
-                # 全部稳定
+                # All stable
                 num_skipped_tokens = orig_seq_len
             
-            # ===== Early Exit（方案A）状态 =====
-            early_exit_stable_mask = None  # (B, L) bool，标记哪些 token 稳定
+            # ===== Early Exit state =====
+            early_exit_stable_mask = None  # (B, L) bool, marks stable tokens
             
             for block_idx in range(num_layers):
                 block = self.transformer.blocks[block_idx]
                 if output_hidden_states:
-                    # 记录 hidden states（如果有 skip，需要合并成完整形状）
+                    # Record hidden states (merge to full shape if skip)
                     if active_indices is not None and len(active_indices) > 0:
                         x_for_record = x_full.clone()
                         x_for_record[:, active_indices, :] = x
@@ -1608,70 +1603,67 @@ class LLaDAModel(nn.Module):
                         all_hidden_states.append(x)
                 
                 if skip_all_layers:
-                    # 全部稳定，只记录 KV cache，不计算
+                    # All stable, only record KV cache, no compute
                     if attn_key_values is not None:
                         attn_key_values.append(past_key_values[block_idx] if past_key_values else None)
                     continue
 
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
                 
-                # ===== Early Exit 判定（在 early_exit_layer 后，基于前16层的平均 cos_sim） =====
+                # ===== Early Exit decision (after early_exit_layer, based on avg cos_sim) =====
                 if (early_exit_layer is not None and 
                     block_idx == early_exit_layer and 
                     prev_hidden_states is not None and 
                     len(prev_hidden_states) > early_exit_layer and
                     len(all_hidden_states) >= early_exit_layer + 1):
-                    # 比较前16层的 cos_sim（包含当前层）
-                    # all_hidden_states: 索引 0 是 embedding 后，索引 i+1 是第 i 层后
-                    # prev_hidden_states: 同样结构，来自上一 step
+                    # Compare cos_sim of first early_exit_layer layers
+                    # all_hidden_states[0] = embedding, [i+1] = layer i output
                     
-                    cos_sims = []  # 存储每一层的 cos_sim
-                    min_cos_sim = None  # 记录最小 cos_sim
+                    cos_sims = []
+                    min_cos_sim = None
                     
-                    for layer_idx in range(early_exit_layer):  # 0 ~ early_exit_layer-1（前16层）
-                        # 当前层的 hidden state（已收集在 all_hidden_states 中）
-                        curr_h = all_hidden_states[layer_idx + 1]  # +1 因为索引 0 是 embedding
+                    for layer_idx in range(early_exit_layer):
+                        curr_h = all_hidden_states[layer_idx + 1]  # +1 for embedding offset
                         prev_h = prev_hidden_states[layer_idx + 1]
                         
-                        # 处理维度：当前可能只是 block，prev 是完整序列
+                        # Handle dimension: current may be block, prev is full seq
                         if block_start_idx is not None and prev_h.shape[1] > curr_h.shape[1]:
                             prev_h_slice = prev_h[:, block_start_idx:block_start_idx + curr_h.shape[1], :]
                         else:
                             prev_h_slice = prev_h
                         
-                        # 计算 cos_sim
+                        # Compute cos_sim
                         layer_cos_sim = F.cosine_similarity(curr_h.float(), prev_h_slice.float(), dim=-1)  # (B, L)
                         cos_sims.append(layer_cos_sim)
                         
-                        # 更新最小值
+                        # Update min value
                         if min_cos_sim is None:
                             min_cos_sim = layer_cos_sim
                         else:
                             min_cos_sim = torch.min(min_cos_sim, layer_cos_sim)
                     
-                    # 计算前16层的平均 cos_sim
+                    # Compute average cos_sim of first early_exit_layer layers
                     avg_cos_sim = torch.stack(cos_sims).mean(dim=0)  # (B, L)
                     
-                    # 主判定：平均 cos_sim >= threshold
+                    # Main decision: avg cos_sim >= threshold
                     early_exit_stable_mask = avg_cos_sim >= early_exit_threshold  # (B, L)
                     
-                    # 保护机制：任意一层 cos_sim < 0.85 → 强制重算
+                    # Safety: any layer cos_sim < 0.85 -> force recompute
                     min_layer_threshold = 0.85
                     unstable_by_min = min_cos_sim < min_layer_threshold  # (B, L)
                     early_exit_stable_mask = early_exit_stable_mask & (~unstable_by_min)
                     
-                    # 上轮 skip 的 token 这轮必须重算（不能被判定为稳定）
+                    # Tokens skipped last step must recompute this step
                     if prev_skipped_indices is not None and len(prev_skipped_indices) > 0:
-                        # prev_skipped_indices 是相对于 block 的索引
                         early_exit_stable_mask[:, prev_skipped_indices] = False
                     
-                    # 记录这轮被 skip 的 token 索引（下轮必须算）
+                    # Record skipped indices (must compute next step)
                     skipped_indices = early_exit_stable_mask[0].nonzero(as_tuple=True)[0] if early_exit_stable_mask.any() else None
                     
-                    # 统计
+                    # Statistics
                     num_skipped_tokens = early_exit_stable_mask.sum().item()
                 
-                # ===== Helper: 判断是否使用 activation checkpointing =====
+                # ===== Helper: check if activation checkpointing =====
                 def _use_activation_ckpt(blk_idx):
                     s = self.activation_checkpointing_strategy
                     return (s == ActivationCheckpointingStrategy.whole_layer or
@@ -1684,33 +1676,33 @@ class LLaDAModel(nn.Module):
                         return self._activation_checkpoint_fn(blk, x_in, attention_bias=attn_bias, layer_past=lp, use_cache=uc, replace_position=rp, position_ids=pos_ids)
                     return blk(x_in, attention_bias=attn_bias, layer_past=lp, use_cache=uc, replace_position=rp, position_ids=pos_ids)
                 
-                # ===== Early Exit: 只对不稳定 token 做 forward =====
+                # ===== Early Exit: only forward unstable tokens =====
                 if (early_exit_stable_mask is not None and 
                     block_idx > early_exit_layer and 
                     early_exit_stable_mask.any() and
                     prev_hidden_states is not None and 
                     len(prev_hidden_states) > block_idx + 1):
                     
-                    # 获取上一 step 的 hidden state
+                    # Get previous step hidden state
                     prev_h = prev_hidden_states[block_idx + 1]
                     prev_h_slice = prev_h[:, block_start_idx:block_start_idx + x.shape[1], :] if (block_start_idx is not None and prev_h.shape[1] > x.shape[1]) else prev_h
                     
-                    # 不稳定 token mask
+                    # Unstable token mask
                     unstable_mask = ~early_exit_stable_mask
                     any_unstable = unstable_mask.any(dim=0)
                     
                     if not any_unstable.any():
-                        # 全部稳定 → 完全跳过
+                        # All stable -> skip completely
                         x, cache = prev_h_slice, layer_past
                     elif any_unstable.all():
-                        # 全部不稳定 → 正常 forward
+                        # All unstable -> normal forward
                         x, cache = _block_forward(block, x, attention_bias, layer_past, use_cache, replace_position, position_ids)
                     else:
-                        # 部分稳定 → 只计算不稳定的 (真正节省计算!)
+                        # Partial stable -> only compute unstable (real savings!)
                         unstable_idx = any_unstable.nonzero(as_tuple=True)[0]
                         x_unstable = x[:, unstable_idx, :]
                         
-                        # 构建不稳定 token 的 position_ids
+                        # Build position_ids for unstable tokens
                         if position_ids is not None:
                             pos_ids_unstable = position_ids[unstable_idx]
                         elif block_start_idx is not None:
@@ -1718,7 +1710,7 @@ class LLaDAModel(nn.Module):
                         else:
                             pos_ids_unstable = unstable_idx
                         
-                        # 构建 replace_position（只更新不稳定 token 的 KV）
+                        # Build replace_position (only update unstable token KV)
                         if replace_position is not None:
                             blk_pos = replace_position[0].nonzero(as_tuple=True)[0]
                             new_rp = torch.zeros_like(replace_position)
@@ -1726,26 +1718,26 @@ class LLaDAModel(nn.Module):
                         else:
                             new_rp = None
                         
-                        # 只对不稳定 token forward
+                        # Forward only unstable tokens
                         x_unstable_new, cache = _block_forward(block, x_unstable, attention_bias, layer_past, use_cache, new_rp, pos_ids_unstable)
                         
-                        # 合并：稳定用 prev，不稳定用新算的
+                        # Merge: stable use prev, unstable use new
                         x = prev_h_slice.clone()
                         x[:, unstable_idx, :] = x_unstable_new
                 else:
-                    # 正常 forward
+                    # Normal forward
                     x, cache = _block_forward(block, x, attention_bias, layer_past, use_cache, replace_position, position_ids)
                 
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
             
-            # ===== 合并：把 active token 的结果放回 =====
+            # ===== Merge: put active token results back =====
             if active_indices is not None and len(active_indices) > 0:
                 x_full[:, active_indices, :] = x
                 x = x_full
             elif x_full is not None:
-                # 全部稳定，x 没变，直接用 x_full
+                # All stable, x unchanged, use x_full directly
                 x = x_full
         else:
             for group_idx, block_group in enumerate(self.transformer.block_groups):
@@ -1787,7 +1779,7 @@ class LLaDAModel(nn.Module):
         if self.config.scale_logits:
             logits.mul_(1 / math.sqrt(self.config.d_model))
 
-        # num_skipped_tokens 可能未定义（block_group_size > 1 或 early exit 未启用）
+        # num_skipped_tokens may be undefined (block_group_size > 1 or early exit disabled)
         _num_skipped = num_skipped_tokens if 'num_skipped_tokens' in locals() else 0
         return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None, skipped_indices=skipped_indices, num_skipped_tokens=_num_skipped)  # type: ignore[arg-type]
 
@@ -1839,15 +1831,15 @@ class LLaDAModelLM(PreTrainedModel):
         return_dict: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        # Token Skip 参数（基于后 N 层 hidden state 判定）
-        prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # 上一 step (T-1) 的后 N 层
-        prev_prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # 上上一 step (T-2) 的后 N 层
+        # Token Skip params (based on last N layers hidden state)
+        prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # T-1 step's last N layers
+        prev_prev_layers_hidden: Optional[List[torch.Tensor]] = None,  # T-2 step's last N layers
         current_step: int = None,
         prev_skipped_indices: Optional[torch.Tensor] = None,
         force_full_every_k: int = 3,
-        skip_threshold: float = 0.99,   # cos_sim 阈值，>= 此值认为稳定可以 skip
-        skip_layers: int = 16,          # 使用后 N 层进行判定
-        # Early Exit 参数（方案A）
+        skip_threshold: float = 0.99,   # cos_sim threshold for skip
+        skip_layers: int = 16,          # Number of layers for skip decision
+        # Early Exit params
         early_exit_layer: int = None,
         early_exit_threshold: float = 1.0,
         prev_hidden_states: Optional[Tuple[torch.Tensor]] = None,
@@ -1900,9 +1892,9 @@ class LLaDAModelLM(PreTrainedModel):
             past_key_values=outputs.attn_key_values,
             hidden_states=hidden_states,
         )
-        # 添加 skipped_indices 供 Token Skip 使用
+        # Add skipped_indices for Token Skip
         result.skipped_indices = outputs.skipped_indices
-        # 添加 num_skipped_tokens 供 Early Exit 统计
+        # Add num_skipped_tokens for Early Exit statistics
         result.num_skipped_tokens = outputs.num_skipped_tokens
         return result
 
