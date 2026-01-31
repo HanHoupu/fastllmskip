@@ -1671,69 +1671,70 @@ class LLaDAModel(nn.Module):
                     # 统计
                     num_skipped_tokens = early_exit_stable_mask.sum().item()
                 
-                # ===== 正常 forward 或带 early exit 的 forward =====
+                # ===== Helper: 判断是否使用 activation checkpointing =====
+                def _use_activation_ckpt(blk_idx):
+                    s = self.activation_checkpointing_strategy
+                    return (s == ActivationCheckpointingStrategy.whole_layer or
+                            (s == ActivationCheckpointingStrategy.one_in_two and blk_idx % 2 == 0) or
+                            (s == ActivationCheckpointingStrategy.one_in_three and blk_idx % 3 == 0) or
+                            (s == ActivationCheckpointingStrategy.one_in_four and blk_idx % 4 == 0))
+                
+                def _block_forward(blk, x_in, attn_bias, lp, uc, rp, pos_ids):
+                    if _use_activation_ckpt(block_idx):
+                        return self._activation_checkpoint_fn(blk, x_in, attention_bias=attn_bias, layer_past=lp, use_cache=uc, replace_position=rp, position_ids=pos_ids)
+                    return blk(x_in, attention_bias=attn_bias, layer_past=lp, use_cache=uc, replace_position=rp, position_ids=pos_ids)
+                
+                # ===== Early Exit: 只对不稳定 token 做 forward =====
                 if (early_exit_stable_mask is not None and 
                     block_idx > early_exit_layer and 
                     early_exit_stable_mask.any() and
                     prev_hidden_states is not None and 
                     len(prev_hidden_states) > block_idx + 1):
-                    # 有稳定 token 且在 early_exit_layer 之后：分流处理
-                    # 1. 所有 token 都做 forward（为了 KV cache 更新）
-                    # 2. 稳定 token 的输出用 prev_hidden_states 替换
                     
-                    # 正常 forward
-                    if (
-                        (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
-                        or (
-                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
-                            and block_idx % 2 == 0
-                        )
-                        or (
-                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
-                            and block_idx % 3 == 0
-                        )
-                        or (
-                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
-                            and block_idx % 4 == 0
-                        )
-                    ):
-                        x_new, cache = self._activation_checkpoint_fn(
-                            block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids
-                        )
+                    # 获取上一 step 的 hidden state
+                    prev_h = prev_hidden_states[block_idx + 1]
+                    prev_h_slice = prev_h[:, block_start_idx:block_start_idx + x.shape[1], :] if (block_start_idx is not None and prev_h.shape[1] > x.shape[1]) else prev_h
+                    
+                    # 不稳定 token mask
+                    unstable_mask = ~early_exit_stable_mask
+                    any_unstable = unstable_mask.any(dim=0)
+                    
+                    if not any_unstable.any():
+                        # 全部稳定 → 完全跳过
+                        x, cache = prev_h_slice, layer_past
+                    elif any_unstable.all():
+                        # 全部不稳定 → 正常 forward
+                        x, cache = _block_forward(block, x, attention_bias, layer_past, use_cache, replace_position, position_ids)
                     else:
-                        x_new, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids)
-                    
-                    # 对稳定 token，用 prev_hidden_states 的结果替换
-                    prev_h = prev_hidden_states[block_idx + 1]  # +1 因为索引 0 是 embedding
-                    if block_start_idx is not None and prev_h.shape[1] > x.shape[1]:
-                        prev_h_slice = prev_h[:, block_start_idx:block_start_idx + x.shape[1], :]
-                    else:
-                        prev_h_slice = prev_h
-                    
-                    # 合并：稳定 token 用 prev，不稳定 token 用新算的
-                    x = torch.where(early_exit_stable_mask.unsqueeze(-1), prev_h_slice, x_new)
+                        # 部分稳定 → 只计算不稳定的 (真正节省计算!)
+                        unstable_idx = any_unstable.nonzero(as_tuple=True)[0]
+                        x_unstable = x[:, unstable_idx, :]
+                        
+                        # 构建不稳定 token 的 position_ids
+                        if position_ids is not None:
+                            pos_ids_unstable = position_ids[unstable_idx]
+                        elif block_start_idx is not None:
+                            pos_ids_unstable = block_start_idx + unstable_idx
+                        else:
+                            pos_ids_unstable = unstable_idx
+                        
+                        # 构建 replace_position（只更新不稳定 token 的 KV）
+                        if replace_position is not None:
+                            blk_pos = replace_position[0].nonzero(as_tuple=True)[0]
+                            new_rp = torch.zeros_like(replace_position)
+                            new_rp[:, blk_pos[unstable_idx]] = True
+                        else:
+                            new_rp = None
+                        
+                        # 只对不稳定 token forward
+                        x_unstable_new, cache = _block_forward(block, x_unstable, attention_bias, layer_past, use_cache, new_rp, pos_ids_unstable)
+                        
+                        # 合并：稳定用 prev，不稳定用新算的
+                        x = prev_h_slice.clone()
+                        x[:, unstable_idx, :] = x_unstable_new
                 else:
-                    # 正常 forward（无 early exit）
-                    if (
-                        (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
-                        or (
-                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_two
-                            and block_idx % 2 == 0
-                        )
-                        or (
-                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_three
-                            and block_idx % 3 == 0
-                        )
-                        or (
-                            self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.one_in_four
-                            and block_idx % 4 == 0
-                        )
-                    ):
-                        x, cache = self._activation_checkpoint_fn(
-                            block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids
-                        )
-                    else:
-                        x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids)
+                    # 正常 forward
+                    x, cache = _block_forward(block, x, attention_bias, layer_past, use_cache, replace_position, position_ids)
                 
                 if attn_key_values is not None:
                     assert cache is not None

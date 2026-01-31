@@ -241,7 +241,8 @@ def generate_with_dual_cache_tokenskip(
         
         # 对完整序列做一次前向传播
         # use_cache=True 表示要保存 KV Cache
-        out_full = model(x, use_cache=True)
+        # output_hidden_states=True 用于收集 hidden states，供 Token Skip 使用
+        out_full = model(x, use_cache=True, output_hidden_states=True)
         
         # 保存 KV Cache，后续步骤会复用
         # past_key_values 是一个 tuple，每层一个 (key, value) 对
