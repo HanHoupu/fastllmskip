@@ -138,6 +138,7 @@ def main():
         'config': vars(args),
         'results': results,
     }
+    os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     with open(args.output, 'w') as f:
         json.dump(save_data, f, indent=2,
                   default=lambda o: float(o) if hasattr(o, '__float__') else str(o))
