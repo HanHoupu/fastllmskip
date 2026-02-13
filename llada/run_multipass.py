@@ -59,10 +59,11 @@ def make_prompt(tokenizer, question):
 
 
 def run_method(method, model, tokenizer, device, ds, args):
+    from tqdm import tqdm
     results = []
     start = time.time()
 
-    for idx in range(args.limit):
+    for idx in tqdm(range(args.limit), desc=f"[{method}]", ncols=100):
         question = ds[idx]['question']
         prompt_text = make_prompt(tokenizer, question)
         input_ids = torch.tensor(tokenizer(prompt_text)['input_ids']).to(device).unsqueeze(0)
@@ -85,7 +86,7 @@ def run_method(method, model, tokenizer, device, ds, args):
         elif method == 'adaptive':
             x, nfe, stats = generate_adaptive(
                 model, input_ids, **gen_kwargs,
-                initial_threshold=args.threshold, target_ratio=0.25)
+                initial_threshold=args.threshold, target_ratio=0.05)
 
         elif method == 'factor':
             x, nfe, stats = generate_factor_multipass(
@@ -113,14 +114,12 @@ def run_method(method, model, tokenizer, device, ds, args):
         }
         results.append(result)
 
-        elapsed = time.time() - start
-        eta = elapsed / (idx + 1) * (args.limit - idx - 1)
         acc_so_far = sum(r['correct'] for r in results) / len(results) * 100
         extra = ""
         if 'passes' in stats:
-            extra = f" passes={stats.get('num_passes', len(stats['passes']))}"
-        print(f"[{method}][{idx+1:3d}/{args.limit}] nfe={nfe:3d}{extra}  "
-              f"{'✓' if correct else '✗'} acc={acc_so_far:.1f}%  ETA={eta:.0f}s")
+            extra = f" p={stats.get('num_passes', len(stats['passes']))}"
+        tqdm.write(f"  #{idx}: nfe={nfe:3d}{extra} {'✓' if correct else '✗'} "
+                   f"pred={pred_answer} gt={gt_answer} acc={acc_so_far:.1f}%")
 
     total_time = time.time() - start
     print(f"\n[{method}] Done! {total_time:.0f}s total ({total_time/args.limit:.1f}s/sample)")
