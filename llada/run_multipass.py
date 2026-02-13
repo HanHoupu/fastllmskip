@@ -13,6 +13,7 @@ import argparse
 import json
 import time
 import os
+import re
 
 import torch
 from transformers import AutoTokenizer
@@ -21,6 +22,17 @@ from datasets import load_dataset
 from model.modeling_llada import LLaDAModelLM
 from generate import generate_with_dual_cache
 from generate_multipass import generate_multipass, generate_adaptive, generate_factor_multipass
+
+
+def extract_gsm8k_answer(text):
+    """从 GSM8K 格式的文本中提取最终数字答案。"""
+    # 优先匹配 #### 后面的数字
+    match = re.search(r'####\s*(-?\d[\d,]*\.?\d*)', text)
+    if match:
+        return match.group(1).replace(',', '')
+    # fallback: 取最后一个数字
+    numbers = re.findall(r'-?\d[\d,]*\.?\d*', text)
+    return numbers[-1].replace(',', '') if numbers else None
 
 
 # ============ 5-shot prompt ============
@@ -83,20 +95,32 @@ def run_method(method, model, tokenizer, device, ds, args):
 
         answer = tokenizer.decode(x[0, plen:], skip_special_tokens=True)
 
+        # 精度：提取预测答案和 ground truth
+        gt_text = ds[idx]['answer']
+        gt_answer = extract_gsm8k_answer(gt_text)
+        pred_answer = extract_gsm8k_answer(answer)
+        correct = (pred_answer is not None and gt_answer is not None
+                   and pred_answer.strip() == gt_answer.strip())
+
         result = {
             'idx': idx,
             'nfe': nfe,
             'answer': answer,
+            'pred': pred_answer,
+            'gt': gt_answer,
+            'correct': correct,
             'stats': stats,
         }
         results.append(result)
 
         elapsed = time.time() - start
         eta = elapsed / (idx + 1) * (args.limit - idx - 1)
+        acc_so_far = sum(r['correct'] for r in results) / len(results) * 100
         extra = ""
         if 'passes' in stats:
             extra = f" passes={stats.get('num_passes', len(stats['passes']))}"
-        print(f"[{method}][{idx+1:3d}/{args.limit}] nfe={nfe:3d}{extra}  ETA={eta:.0f}s")
+        print(f"[{method}][{idx+1:3d}/{args.limit}] nfe={nfe:3d}{extra}  "
+              f"{'✓' if correct else '✗'} acc={acc_so_far:.1f}%  ETA={eta:.0f}s")
 
     total_time = time.time() - start
     print(f"\n[{method}] Done! {total_time:.0f}s total ({total_time/args.limit:.1f}s/sample)")
