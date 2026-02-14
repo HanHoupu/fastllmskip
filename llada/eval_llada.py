@@ -71,6 +71,7 @@ class LLaDAEvalHarness(LM):
         mid_trigger_ratio=0.5,
         rewarm_on_expand=True,
         step_records_dir=None,
+        seed=None,
         **kwargs,
     ):
         '''
@@ -91,6 +92,10 @@ class LLaDAEvalHarness(LM):
             cfg_scale: Unsupervised classifier-free guidance scale.
         '''
         super().__init__()
+
+        if seed is not None:
+            set_seed(int(seed))
+            print(f"Seed set to {seed}")
 
         accelerator = accelerate.Accelerator()
         if accelerator.num_processes > 1:
