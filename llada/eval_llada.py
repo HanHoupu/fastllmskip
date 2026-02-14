@@ -33,7 +33,7 @@ from lm_eval.api.registry import register_model
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from generate import generate, generate_with_prefix_cache, generate_with_dual_cache
+from generate import generate, generate_with_prefix_cache, generate_with_dual_cache, generate_with_dual_cache_expand
 from model.modeling_llada import LLaDAModelLM
 import json
 import time
@@ -67,6 +67,10 @@ class LLaDAEvalHarness(LM):
         save_dir=None,
         show_speed=False,
         dual_cache=False,
+        mid_block_expand=False,
+        mid_trigger_ratio=0.5,
+        rewarm_on_expand=True,
+        step_records_dir=None,
         **kwargs,
     ):
         '''
@@ -132,6 +136,11 @@ class LLaDAEvalHarness(LM):
         self.save_dir = save_dir
         self.show_speed = show_speed
         self.dual_cache = dual_cache
+        self.mid_block_expand = mid_block_expand
+        self.mid_trigger_ratio = float(mid_trigger_ratio)
+        self.rewarm_on_expand = rewarm_on_expand
+        self.step_records_dir = step_records_dir
+        self._all_step_records = []  # collected when step_records_dir is set
     @property
     def rank(self):
         return self._rank
@@ -336,8 +345,25 @@ class LLaDAEvalHarness(LM):
 
             stop_tokens = req.args[1]['until']
             input_ids = batched_input_ids
+            step_records = None
             if self.use_cache:
-                if self.dual_cache:
+                if self.mid_block_expand:
+                    # Mid-block chain expansion variant
+                    _record = (self.step_records_dir is not None)
+                    ret = generate_with_dual_cache_expand(
+                        self.model, input_ids, steps=self.steps,
+                        gen_length=self.gen_length, block_length=self.block_length,
+                        temperature=0, remasking=self.remasking,
+                        mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                        mid_trigger_ratio=self.mid_trigger_ratio,
+                        rewarm_on_expand=self.rewarm_on_expand,
+                        record_steps=_record,
+                    )
+                    if _record:
+                        generated_answer, nfe, step_records = ret
+                    else:
+                        generated_answer, nfe = ret
+                elif self.dual_cache:
                     generated_answer, nfe = generate_with_dual_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
                 else:
@@ -346,6 +372,9 @@ class LLaDAEvalHarness(LM):
             else:
                 generated_answer, nfe = generate(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+            
+            if step_records is not None:
+                self._all_step_records.append(step_records)
 
             if self.is_instruct and 'task_id' in req.doc and str(req.doc['task_id']).lower().startswith('humaneval'):
                 generated_answer_ids = generated_answer[:, input_ids.shape[1]:]
@@ -390,7 +419,15 @@ class LLaDAEvalHarness(LM):
             print(f"Total time taken: {end_time - start_time} seconds")
             print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
             print(f"Total NFE is {num_nfe}")
-            
+
+        # Save step records to JSON if enabled
+        if self.step_records_dir and self._all_step_records:
+            os.makedirs(self.step_records_dir, exist_ok=True)
+            records_path = os.path.join(self.step_records_dir, 'step_records.json')
+            with open(records_path, 'w', encoding='utf-8') as f:
+                json.dump(self._all_step_records, f)
+            print(f"Step records saved to {records_path} ({len(self._all_step_records)} samples)")
+
         return output
 
 
