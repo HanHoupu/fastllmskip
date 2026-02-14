@@ -294,6 +294,204 @@ def generate_with_dual_cache(
     return x, nfe
 
 
+@torch.no_grad()
+def generate_with_dual_cache_expand(
+    model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
+    remasking="low_confidence", mask_id=126336, threshold=None, factor=None,
+    mid_trigger_ratio=0.5,
+    rewarm_on_expand=True,
+    record_steps=False,
+):
+    """
+    Dual-cache block-wise generation with mid-block chain expansion.
+
+    Behaviour identical to generate_with_dual_cache when expansion never
+    triggers (i.e. all masks in a block are resolved before the midpoint).
+
+    New hyper-parameters
+    --------------------
+    mid_trigger_ratio : float, default 0.5
+        When the fraction of remaining masks in the *watched* original block
+        drops to this ratio (e.g. 0.5 → half decoded), expansion is triggered.
+    rewarm_on_expand : bool, default True
+        If True, a full forward pass (re-warm KV cache) is performed on each
+        expansion.  Set to False to skip re-warm and let the next block-level
+        refinement step update the KV instead (saves 1 NFE per expansion).
+    record_steps : bool, default False
+        If True, return a third element: a list of per-step dicts recording
+        tokens transferred, remaining masks, step type, etc.
+        Return signature becomes (x, nfe, step_records).
+
+    Chain expansion example  (block_length=32, 3 blocks)
+    -----------------------------------------------------
+    Block 0 refinement → midpoint triggered → expand range to Block 1
+    → Block 1 midpoint triggered → expand range to Block 2
+    → finish refinement on the merged super-block → nb jumps by 3.
+    """
+    B = prompt.shape[0]
+    Lp = int(prompt.shape[1])
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+
+    assert steps % num_blocks == 0
+    steps_per_block = steps // num_blocks
+
+    x = torch.full((B, Lp + gen_length), mask_id, dtype=torch.long, device=model.device)
+    x[:, :Lp] = prompt
+
+    nfe = 0
+    trigger_thresh = int(block_length * mid_trigger_ratio)
+
+    # Step recording for per-step analysis
+    step_records = []
+    global_step = 0
+
+    nb = 0
+    while nb < num_blocks:
+        s = Lp + nb * block_length
+        e = s + block_length
+
+        # ---- Phase 1: warm KV-cache (full forward) on current block ----
+        block_mask = (x[:, s:e] == mask_id)
+        num_tt = get_num_transfer_tokens(block_mask, steps_per_block)
+
+        out = model(x, use_cache=True)
+        past_kv = out.past_key_values
+        nfe += 1
+
+        rp = torch.zeros_like(x, dtype=torch.bool)
+        rp[:, s:e] = True
+
+        # Step 0: transfer using full-sequence logits
+        gmi = (x == mask_id)
+        gmi[:, e:] = False
+        if factor is None:
+            q0 = None if threshold is not None else num_tt[:, 0]
+            x0, ti = get_transfer_index(
+                out.logits, temperature, remasking, gmi, x, q0, threshold)
+        else:
+            x0, ti = get_transfer_index_dynamic(
+                out.logits, temperature, remasking, gmi, x, None, factor)
+        x = torch.where(ti, x0, x)
+
+        if record_steps:
+            step_records.append({
+                'global_step': global_step, 'block': nb,
+                'type': 'warm', 'transferred': int(ti.sum().item()),
+                'remaining': int((x[:, s:e] == mask_id).sum().item()),
+                'range': (s - Lp, e - Lp),
+            })
+            global_step += 1
+
+        # ---- Phase 2: refinement with potential chain expansions ----
+        watching_nb = nb          # which original block we check for midpoint
+        blocks_consumed = 1       # total original blocks this iteration covers
+        step_idx = 1              # pointer into current num_tt schedule
+
+        while step_idx < num_tt.shape[1]:
+            if (x[:, s:e] == mask_id).sum() == 0:
+                break
+
+            # -- Midpoint check on the watched block --
+            can_expand = (watching_nb + 1 < num_blocks)
+            if can_expand:
+                wb_s = Lp + watching_nb * block_length
+                wb_e = wb_s + block_length
+                remaining_masks = int(
+                    (x[:, wb_s:wb_e] == mask_id).sum(dim=1).max().item())
+
+                if remaining_masks <= trigger_thresh:
+                    # ========== EXPAND ==========
+                    next_nb = watching_nb + 1
+                    e_new = min(Lp + (next_nb + 1) * block_length,
+                                Lp + gen_length)
+
+                    # Shrink start to first remaining mask in [s, e_new)
+                    mask_pos = (x[0, s:e_new] == mask_id).nonzero(as_tuple=True)[0]
+                    s = (s + mask_pos[0].item()) if len(mask_pos) > 0 else s
+                    e = e_new
+
+                    if rewarm_on_expand:
+                        out = model(x, use_cache=True)
+                        past_kv = out.past_key_values
+                        nfe += 1
+
+                    # Update replace_position for expanded range
+                    rp = torch.zeros_like(x, dtype=torch.bool)
+                    rp[:, s:e] = True
+
+                    # Fresh transfer schedule (one block's worth of steps)
+                    exp_mask = (x[:, s:e] == mask_id)
+                    num_tt = get_num_transfer_tokens(exp_mask, steps_per_block)
+                    step_idx = 0
+
+                    blocks_consumed += 1
+                    watching_nb = next_nb
+
+                    # If re-warmed, use full logits for step-0 of expanded
+                    if rewarm_on_expand:
+                        gmi = (x == mask_id)
+                        gmi[:, e:] = False
+                        if factor is None:
+                            q0 = None if threshold is not None else num_tt[:, 0]
+                            x0, ti = get_transfer_index(
+                                out.logits, temperature, remasking,
+                                gmi, x, q0, threshold)
+                        else:
+                            x0, ti = get_transfer_index_dynamic(
+                                out.logits, temperature, remasking,
+                                gmi, x, None, factor)
+                        x = torch.where(ti, x0, x)
+                        if record_steps:
+                            step_records.append({
+                                'global_step': global_step, 'block': watching_nb,
+                                'type': 'expand', 'transferred': int(ti.sum().item()),
+                                'remaining': int((x[:, s:e] == mask_id).sum().item()),
+                                'range': (s - Lp, e - Lp),
+                            })
+                            global_step += 1
+                        step_idx = 1
+                        continue
+                    # rewarm_on_expand=False: fall through to normal refinement
+                    # (step_idx=0 → first block-level call serves as soft re-warm)
+                    # ========== END EXPAND ==========
+
+            # -- Normal refinement step --
+            logits_blk = model(
+                x[:, s:e], past_key_values=past_kv,
+                use_cache=True, replace_position=rp
+            ).logits
+
+            mask_blk = (x[:, s:e] == mask_id)
+            if factor is None:
+                qi = None if threshold is not None else num_tt[:, step_idx]
+                x0_blk, ti_blk = get_transfer_index(
+                    logits_blk, temperature, remasking,
+                    mask_blk, x[:, s:e], qi, threshold)
+            else:
+                x0_blk, ti_blk = get_transfer_index_dynamic(
+                    logits_blk, temperature, remasking,
+                    mask_blk, x[:, s:e], None, factor)
+
+            blk_new = torch.where(ti_blk, x0_blk, x[:, s:e])
+            x = torch.cat([x[:, :s], blk_new, x[:, e:]], dim=1)
+            nfe += 1
+            if record_steps:
+                step_records.append({
+                    'global_step': global_step, 'block': watching_nb,
+                    'type': 'refine', 'transferred': int(ti_blk.sum().item()),
+                    'remaining': int((blk_new == mask_id).sum().item()),
+                    'range': (s - Lp, e - Lp),
+                })
+                global_step += 1
+            step_idx += 1
+
+        nb += blocks_consumed
+
+    if record_steps:
+        return x, nfe, step_records
+    return x, nfe
+
 
 def get_transfer_index(
     logits: torch.Tensor,
