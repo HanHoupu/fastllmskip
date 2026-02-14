@@ -388,10 +388,58 @@ def generate_with_dual_cache_expand(
         watching_nb = nb          # which original block we check for midpoint
         blocks_consumed = 1       # total original blocks this iteration covers
         step_idx = 1              # pointer into current num_tt schedule
+        # For rewarm_on_expand=False: track which blocks' completion triggers
+        # a deferred full forward (block-boundary re-warm).
+        # List to support chain: Block0 pending + Block1 midpoint before Block0 done.
+        pending_rewarm_blocks = []
 
         while step_idx < num_tt.shape[1]:
             if (x[:, s:e] == mask_id).sum() == 0:
                 break
+
+            # -- [no_rewarm] Check if ANY pending block is fully decoded → full forward --
+            if not rewarm_on_expand and pending_rewarm_blocks:
+                completed = [
+                    pb for pb in pending_rewarm_blocks
+                    if int((x[:, Lp + pb * block_length : Lp + (pb + 1) * block_length]
+                            == mask_id).sum(dim=1).max().item()) == 0
+                ]
+                if completed:
+                    # One full forward covers all just-completed blocks
+                    out = model(x, use_cache=True)
+                    past_kv = out.past_key_values
+                    nfe += 1
+                    for pb in completed:
+                        pending_rewarm_blocks.remove(pb)
+
+                    rp = torch.zeros_like(x, dtype=torch.bool)
+                    rp[:, s:e] = True
+
+                    # Use fresh full logits for a transfer step
+                    gmi = (x == mask_id)
+                    gmi[:, e:] = False
+                    if factor is None:
+                        q0 = None if threshold is not None else num_tt[:, step_idx]
+                        x0, ti = get_transfer_index(
+                            out.logits, temperature, remasking,
+                            gmi, x, q0, threshold)
+                    else:
+                        x0, ti = get_transfer_index_dynamic(
+                            out.logits, temperature, remasking,
+                            gmi, x, None, factor)
+                    x = torch.where(ti, x0, x)
+                    if record_steps:
+                        step_records.append({
+                            'global_step': global_step, 'block': watching_nb,
+                            'type': 'block_rewarm',
+                            'transferred': int(ti.sum().item()),
+                            'remaining': int((x[:, s:e] == mask_id).sum().item()),
+                            'range': (s - Lp, e - Lp),
+                            'mask_snapshot': (x[0, Lp:] == mask_id).cpu().tolist(),
+                        })
+                        global_step += 1
+                    step_idx += 1
+                    continue
 
             # -- Midpoint check on the watched block --
             can_expand = (watching_nb + 1 < num_blocks)
@@ -416,6 +464,9 @@ def generate_with_dual_cache_expand(
                         out = model(x, use_cache=True)
                         past_kv = out.past_key_values
                         nfe += 1
+                    else:
+                        # Defer full forward until this block is fully decoded
+                        pending_rewarm_blocks.append(watching_nb)
 
                     # Update replace_position for expanded range
                     rp = torch.zeros_like(x, dtype=torch.bool)
@@ -455,7 +506,7 @@ def generate_with_dual_cache_expand(
                         step_idx = 1
                         continue
                     # rewarm_on_expand=False: fall through to normal refinement
-                    # (step_idx=0 → first block-level call serves as soft re-warm)
+                    # (pending_rewarm_block set, full forward deferred to block completion)
                     # ========== END EXPAND ==========
 
             # -- Normal refinement step --
