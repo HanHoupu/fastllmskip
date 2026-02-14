@@ -380,6 +380,7 @@ def generate_with_dual_cache_expand(
                 'type': 'warm', 'transferred': int(ti.sum().item()),
                 'remaining': int((x[:, s:e] == mask_id).sum().item()),
                 'range': (s - Lp, e - Lp),
+                'mask_snapshot': (x[0, Lp:] == mask_id).cpu().tolist(),
             })
             global_step += 1
 
@@ -448,6 +449,7 @@ def generate_with_dual_cache_expand(
                                 'type': 'expand', 'transferred': int(ti.sum().item()),
                                 'remaining': int((x[:, s:e] == mask_id).sum().item()),
                                 'range': (s - Lp, e - Lp),
+                                'mask_snapshot': (x[0, Lp:] == mask_id).cpu().tolist(),
                             })
                             global_step += 1
                         step_idx = 1
@@ -482,6 +484,7 @@ def generate_with_dual_cache_expand(
                     'type': 'refine', 'transferred': int(ti_blk.sum().item()),
                     'remaining': int((blk_new == mask_id).sum().item()),
                     'range': (s - Lp, e - Lp),
+                    'mask_snapshot': (x[0, Lp:] == mask_id).cpu().tolist(),
                 })
                 global_step += 1
             step_idx += 1
