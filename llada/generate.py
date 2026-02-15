@@ -300,6 +300,7 @@ def generate_with_dual_cache_expand(
     remasking="low_confidence", mask_id=126336, threshold=None, factor=None,
     mid_trigger_ratio=0.5,
     rewarm_on_expand=True,
+    front_block_fallback_only=False,
     record_steps=False,
 ):
     """
@@ -317,6 +318,9 @@ def generate_with_dual_cache_expand(
         If True, a full forward pass (re-warm KV cache) is performed on each
         expansion.  Set to False to skip re-warm and let the next block-level
         refinement step update the KV instead (saves 1 NFE per expansion).
+    front_block_fallback_only : bool, default False
+        If True, threshold fallback ("at least one token transfer") is only
+        allowed on the current front unresolved block.
     record_steps : bool, default False
         If True, return a third element: a list of per-step dicts recording
         tokens transferred, remaining masks, step type, etc.
@@ -365,10 +369,17 @@ def generate_with_dual_cache_expand(
         # Step 0: transfer using full-sequence logits
         gmi = (x == mask_id)
         gmi[:, e:] = False
+        warm_fallback_mask = None
+        if front_block_fallback_only:
+            warm_fallback_mask = torch.zeros_like(gmi, dtype=torch.bool)
+            warm_fallback_mask[:, s:e] = True
         if factor is None:
             q0 = None if threshold is not None else num_tt[:, 0]
             x0, ti = get_transfer_index(
-                out.logits, temperature, remasking, gmi, x, q0, threshold)
+                out.logits, temperature, remasking, gmi, x, q0, threshold,
+                allow_fallback=True,
+                fallback_mask=warm_fallback_mask,
+            )
         else:
             x0, ti = get_transfer_index_dynamic(
                 out.logits, temperature, remasking, gmi, x, None, factor)
@@ -392,6 +403,31 @@ def generate_with_dual_cache_expand(
         # a deferred full forward (block-boundary re-warm).
         # List to support chain: Block0 pending + Block1 midpoint before Block0 done.
         pending_rewarm_blocks = []
+
+        def _get_front_unresolved_block() -> int:
+            for blk_idx in range(nb, watching_nb + 1):
+                blk_s = Lp + blk_idx * block_length
+                blk_e = min(blk_s + block_length, Lp + gen_length)
+                if bool((x[:, blk_s:blk_e] == mask_id).any().item()):
+                    return blk_idx
+            return watching_nb
+
+        def _build_front_fallback_mask(mask_tensor: torch.Tensor, seq_start: int):
+            if not front_block_fallback_only:
+                return None
+
+            front_nb = _get_front_unresolved_block()
+            front_s = Lp + front_nb * block_length
+            front_e = min(front_s + block_length, Lp + gen_length)
+
+            seq_end = seq_start + int(mask_tensor.shape[1])
+            local_s = max(front_s, seq_start)
+            local_e = min(front_e, seq_end)
+
+            fallback_mask = torch.zeros_like(mask_tensor, dtype=torch.bool)
+            if local_s < local_e:
+                fallback_mask[:, local_s - seq_start:local_e - seq_start] = True
+            return fallback_mask
 
         while step_idx < num_tt.shape[1]:
             if (x[:, s:e] == mask_id).sum() == 0:
@@ -422,7 +458,10 @@ def generate_with_dual_cache_expand(
                         q0 = None if threshold is not None else num_tt[:, step_idx]
                         x0, ti = get_transfer_index(
                             out.logits, temperature, remasking,
-                            gmi, x, q0, threshold)
+                            gmi, x, q0, threshold,
+                            allow_fallback=True,
+                            fallback_mask=_build_front_fallback_mask(gmi, 0),
+                        )
                     else:
                         x0, ti = get_transfer_index_dynamic(
                             out.logits, temperature, remasking,
@@ -488,7 +527,10 @@ def generate_with_dual_cache_expand(
                             q0 = None if threshold is not None else num_tt[:, 0]
                             x0, ti = get_transfer_index(
                                 out.logits, temperature, remasking,
-                                gmi, x, q0, threshold)
+                                gmi, x, q0, threshold,
+                                allow_fallback=True,
+                                fallback_mask=_build_front_fallback_mask(gmi, 0),
+                            )
                         else:
                             x0, ti = get_transfer_index_dynamic(
                                 out.logits, temperature, remasking,
@@ -520,7 +562,10 @@ def generate_with_dual_cache_expand(
                 qi = None if threshold is not None else num_tt[:, step_idx]
                 x0_blk, ti_blk = get_transfer_index(
                     logits_blk, temperature, remasking,
-                    mask_blk, x[:, s:e], qi, threshold)
+                    mask_blk, x[:, s:e], qi, threshold,
+                    allow_fallback=True,
+                    fallback_mask=_build_front_fallback_mask(mask_blk, s),
+                )
             else:
                 x0_blk, ti_blk = get_transfer_index_dynamic(
                     logits_blk, temperature, remasking,
@@ -555,6 +600,8 @@ def get_transfer_index(
     x: torch.Tensor,            # (B, L) long
     num_transfer_tokens,        # (B,) or (B,1) long tensor, or None when threshold is used
     threshold: float = None,
+    allow_fallback: bool = True,
+    fallback_mask: torch.Tensor = None,
 ):
     """
     Returns:
@@ -588,12 +635,21 @@ def get_transfer_index(
         # (No top-k; purely threshold-based)
         transfer_index = mask_index & (confidence >= threshold)
 
-        # at least one token is transferred "always unmask max c^i"
-        max_conf_indices = torch.argmax(confidence, dim=1, keepdim=True) # (B, 1)
-        force_mask = torch.zeros_like(transfer_index).scatter_(1, max_conf_indices, True)
+        if allow_fallback:
+            # at least one token is transferred "always unmask max c^i"
+            if fallback_mask is None:
+                fallback_candidates = mask_index
+            else:
+                fallback_candidates = mask_index & fallback_mask
 
-        # (Above Threshold) OR (Is Max Confidence)
-        transfer_index = transfer_index | force_mask
+            cand_conf = torch.where(fallback_candidates, confidence, neg_inf)
+            has_candidate = fallback_candidates.any(dim=1, keepdim=True)
+            max_conf_indices = torch.argmax(cand_conf, dim=1, keepdim=True)  # (B, 1)
+            force_mask = torch.zeros_like(transfer_index).scatter_(1, max_conf_indices, True)
+            force_mask = force_mask & has_candidate
+
+            # (Above Threshold) OR (Is Max Confidence)
+            transfer_index = transfer_index | force_mask
 
         # Safety: do not unmask something that was not masked (consider fully unmasked rows)
         transfer_index = transfer_index & mask_index
