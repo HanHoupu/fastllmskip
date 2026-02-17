@@ -301,6 +301,7 @@ def generate_with_dual_cache_expand(
     mid_trigger_ratio=0.5,
     rewarm_on_expand=True,
     front_block_fallback_only=False,
+    hfb=None,
     record_steps=False,
 ):
     """
@@ -321,6 +322,14 @@ def generate_with_dual_cache_expand(
     front_block_fallback_only : bool, default False
         If True, threshold fallback ("at least one token transfer") is only
         allowed on the current front unresolved block.
+    hfb : float or None, default None
+        Hybrid front-block fallback ratio.  When set (e.g. 0.66), the
+        front_block_fallback_only restriction is *disabled* until the
+        fraction of decoded (non-mask) tokens in the generation window
+        reaches this ratio.  Before that point, fallback is unrestricted;
+        after that point, it is limited to the front unresolved block.
+        None or 0 disables this feature (fb follows front_block_fallback_only
+        at all times).
     record_steps : bool, default False
         If True, return a third element: a list of per-step dicts recording
         tokens transferred, remaining masks, step type, etc.
@@ -346,6 +355,19 @@ def generate_with_dual_cache_expand(
     nfe = 0
     trigger_thresh = int(block_length * mid_trigger_ratio)
 
+    # hfb: hybrid front-block fallback – fb only activates after enough tokens decoded
+    hfb_threshold = int(gen_length * hfb) if hfb else 0  # 0 means hfb disabled
+
+    def _hfb_active() -> bool:
+        """Return True when front_block_fallback should be enforced."""
+        if not front_block_fallback_only:
+            return False
+        if hfb_threshold <= 0:
+            # hfb disabled → fb always active (original behaviour)
+            return True
+        decoded = int((x[:, Lp:Lp + gen_length] != mask_id).sum(dim=1).max().item())
+        return decoded >= hfb_threshold
+
     # Step recording for per-step analysis
     step_records = []
     global_step = 0
@@ -370,7 +392,7 @@ def generate_with_dual_cache_expand(
         gmi = (x == mask_id)
         gmi[:, e:] = False
         warm_fallback_mask = None
-        if front_block_fallback_only:
+        if _hfb_active():
             warm_fallback_mask = torch.zeros_like(gmi, dtype=torch.bool)
             warm_fallback_mask[:, s:e] = True
         if factor is None:
@@ -413,7 +435,7 @@ def generate_with_dual_cache_expand(
             return watching_nb
 
         def _build_front_fallback_mask(mask_tensor: torch.Tensor, seq_start: int):
-            if not front_block_fallback_only:
+            if not _hfb_active():
                 return None
 
             front_nb = _get_front_unresolved_block()

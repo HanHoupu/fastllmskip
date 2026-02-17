@@ -71,6 +71,7 @@ class LLaDAEvalHarness(LM):
         mid_trigger_ratio=0.5,
         rewarm_on_expand=True,
         front_block_fallback_only=False,
+        hfb=None,
         step_records_dir=None,
         seed=None,
         **kwargs,
@@ -146,6 +147,7 @@ class LLaDAEvalHarness(LM):
         self.mid_trigger_ratio = float(mid_trigger_ratio)
         self.rewarm_on_expand = rewarm_on_expand
         self.front_block_fallback_only = front_block_fallback_only
+        self.hfb = float(hfb) if hfb is not None else None
         self.step_records_dir = step_records_dir
         self._all_step_records = []  # collected when step_records_dir is set
     @property
@@ -365,6 +367,7 @@ class LLaDAEvalHarness(LM):
                         mid_trigger_ratio=self.mid_trigger_ratio,
                         rewarm_on_expand=self.rewarm_on_expand,
                         front_block_fallback_only=self.front_block_fallback_only,
+                        hfb=self.hfb,
                         record_steps=_record,
                     )
                     if _record:
