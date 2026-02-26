@@ -433,7 +433,9 @@ class RotaryEmbedding(nn.Module):
         return ((t * pos_cos) + (self.rotate_half(t) * pos_sin)).to(t.dtype)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor,
-                block_end_index: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                block_end_index: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.LongTensor] = None,
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.config.rope_full_precision:
             q_, k_ = q.float(), k.float()
         else:
@@ -441,28 +443,42 @@ class RotaryEmbedding(nn.Module):
 
         with torch.autocast(q.device.type, enabled=False):
             query_len, key_len = q_.shape[-2], k_.shape[-2]
-            pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
-            pos_sin = pos_sin.type_as(q_)
-            pos_cos = pos_cos.type_as(q_)
 
-            # Build tensor indices instead of using .item()
-            if block_end_index is None:
-                start = key_len - query_len
-                end = key_len
+            if position_ids is not None:
+                # Non-contiguous position mode: index RoPE table by explicit ids.
+                max_pos = int(position_ids.max().item()) + 1
+                pos_sin, pos_cos = self.get_rotary_embedding(max_pos, q_.device)
+                pos_sin = pos_sin.type_as(q_)
+                pos_cos = pos_cos.type_as(q_)
+
+                pid = position_ids[0]  # [key_len] – same across batch
+                pos_sin_k = pos_sin[:, :, pid, :]
+                pos_cos_k = pos_cos[:, :, pid, :]
+
+                pos_sin_q = pos_sin_k[:, :, -query_len:, :]
+                pos_cos_q = pos_cos_k[:, :, -query_len:, :]
+
+                q_ = self.apply_rotary_pos_emb(pos_sin_q, pos_cos_q, q_)
+                k_ = self.apply_rotary_pos_emb(pos_sin_k, pos_cos_k, k_)
             else:
-                # block_end_index is a tensor; keep ops tensor-based
-                start = (block_end_index - query_len)
-                end = block_end_index
+                pos_sin, pos_cos = self.get_rotary_embedding(key_len, q_.device)
+                pos_sin = pos_sin.type_as(q_)
+                pos_cos = pos_cos.type_as(q_)
 
-            # Make an index tensor [start, ..., end-1] on the right device/dtype
-            idx = torch.arange(start, end, device=q_.device, dtype=torch.long)
+                if block_end_index is None:
+                    start = key_len - query_len
+                    end = key_len
+                else:
+                    start = (block_end_index - query_len)
+                    end = block_end_index
 
-            # Use index_select on the sequence dimension (dim=2)
-            pos_sin_slice = pos_sin.index_select(2, idx)
-            pos_cos_slice = pos_cos.index_select(2, idx)
+                idx = torch.arange(start, end, device=q_.device, dtype=torch.long)
 
-            q_ = self.apply_rotary_pos_emb(pos_sin_slice, pos_cos_slice, q_)
-            k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
+                pos_sin_slice = pos_sin.index_select(2, idx)
+                pos_cos_slice = pos_cos.index_select(2, idx)
+
+                q_ = self.apply_rotary_pos_emb(pos_sin_slice, pos_cos_slice, q_)
+                k_ = self.apply_rotary_pos_emb(pos_sin, pos_cos, k_)
 
         return q_.type_as(q), k_.type_as(k)
 
@@ -709,6 +725,7 @@ class LLaDABlock(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         replace_position: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = q.size()  # batch size, sequence length, d_model
         dtype = k.dtype
@@ -756,7 +773,9 @@ class LLaDABlock(nn.Module):
 
         if self.config.rope:
             # Apply rotary embeddings.
-            if replace_position is None:
+            if position_ids is not None:
+                q, k = self.rotary_emb(q, k, position_ids=position_ids)
+            elif replace_position is None:
                 q, k = self.rotary_emb(q, k)
             else:
                 # For batched replace_position, use the maximum position across all batches
@@ -957,6 +976,7 @@ class LLaDALlamaBlock(LLaDABlock):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         replace_position: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -975,10 +995,10 @@ class LLaDALlamaBlock(LLaDABlock):
         # Get attention scores.
         if self._activation_checkpoint_fn is not None:
             att, cache = self._activation_checkpoint_fn(  # type: ignore
-                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position
+                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids
             )
         else:
-            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position)
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -1347,6 +1367,7 @@ class LLaDAModel(nn.Module):
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1487,11 +1508,11 @@ class LLaDAModel(nn.Module):
                 ):
                     # shape: (batch_size, seq_len, d_model)
                     x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position
+                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids
                     )
                 else:
                     # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position)
+                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position,position_ids=position_ids)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
@@ -1584,6 +1605,7 @@ class LLaDAModelLM(PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         replace_position: Optional[torch.Tensor] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1603,6 +1625,7 @@ class LLaDAModelLM(PreTrainedModel):
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             replace_position=replace_position,
+            position_ids=position_ids,
         )
         # import pdb; pdb.set_trace()
         logits = outputs.logits
