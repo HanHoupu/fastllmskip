@@ -33,7 +33,10 @@ from lm_eval.api.registry import register_model
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from generate import generate, generate_with_prefix_cache, generate_with_dual_cache, generate_with_dual_cache_expand
+from generate import (generate, generate_with_prefix_cache, generate_with_dual_cache,
+                      generate_with_dual_cache_expand, generate_with_streaming_cache,
+                      generate_with_dual_cache_saber, generate_with_expand_saber,
+                      generate_with_expand_saber_dynamic)
 from model.modeling_llada import LLaDAModelLM
 import json
 import time
@@ -74,6 +77,37 @@ class LLaDAEvalHarness(LM):
         hfb=None,
         step_records_dir=None,
         seed=None,
+        suffix_mode=None,
+        window_blocks=2,
+        adaptive_alpha=None,
+        streaming_cache=False,
+        expand_trigger_mode=None,
+        vel_threshold=0.5,
+        conf_threshold=0.7,
+        saber_dual_cache=False,
+        saber_expand=False,
+        saber_n=2,
+        saber_mu=8,
+        berm_mode='cross_step',
+        saber_global_aadu=False,
+        saber_mtr=0.8,
+        saber_post_global_berm_rounds=0,
+        saber_post_global_berm_window_mul=1,
+        saber_fullstage_berm=False,
+        saber_fullstage_berm_on_rewarm=True,
+        saber_berm_scope='window',
+        saber_dynamic=False,
+        saber_n_hi=8,
+        saber_n_lo=3,
+        saber_mu_lo=4,
+        saber_mu_hi=16,
+        saber_gamma_n=1.0,
+        saber_gamma_mu=1.0,
+        saber_gamma_floor=1.5,
+        saber_remask_ratio_hi=0.35,
+        saber_floor_lo=0,
+        eos_penalty=0.0,
+        eos_token_id=None,
         **kwargs,
     ):
         '''
@@ -150,6 +184,38 @@ class LLaDAEvalHarness(LM):
         self.hfb = float(hfb) if hfb is not None else None
         self.step_records_dir = step_records_dir
         self._all_step_records = []  # collected when step_records_dir is set
+        self.suffix_mode = suffix_mode if suffix_mode not in (None, 'None', 'none', 'full') else None
+        self.window_blocks = int(window_blocks)
+        self.adaptive_alpha = float(adaptive_alpha) if adaptive_alpha is not None else None
+        self.streaming_cache = (str(streaming_cache).lower() in ('true', '1', 'yes'))
+        self.expand_trigger_mode = expand_trigger_mode if expand_trigger_mode not in (None, 'None', 'none') else 'ratio'
+        self.vel_threshold = float(vel_threshold)
+        self.conf_threshold = float(conf_threshold)
+        self.saber_dual_cache = (str(saber_dual_cache).lower() in ('true', '1', 'yes'))
+        self.saber_expand = (str(saber_expand).lower() in ('true', '1', 'yes'))
+        self.saber_n = int(saber_n)
+        self.saber_mu = int(saber_mu)
+        self.berm_mode = str(berm_mode)
+        self.saber_global_aadu = (str(saber_global_aadu).lower() in ('true', '1', 'yes'))
+        self.saber_mtr = float(saber_mtr)
+        self.saber_post_global_berm_rounds = int(saber_post_global_berm_rounds)
+        self.saber_post_global_berm_window_mul = int(saber_post_global_berm_window_mul)
+        self.saber_fullstage_berm = (str(saber_fullstage_berm).lower() in ('true', '1', 'yes'))
+        self.saber_fullstage_berm_on_rewarm = (str(saber_fullstage_berm_on_rewarm).lower() in ('true', '1', 'yes'))
+        self.saber_berm_scope = str(saber_berm_scope)
+        self.saber_dynamic = (str(saber_dynamic).lower() in ('true', '1', 'yes'))
+        self.saber_n_hi = int(saber_n_hi)
+        self.saber_n_lo = int(saber_n_lo)
+        self.saber_mu_lo = int(saber_mu_lo)
+        self.saber_mu_hi = int(saber_mu_hi)
+        self.saber_gamma_n = float(saber_gamma_n)
+        self.saber_gamma_mu = float(saber_gamma_mu)
+        self.saber_gamma_floor = float(saber_gamma_floor)
+        self.saber_remask_ratio_hi = float(saber_remask_ratio_hi)
+        self.saber_floor_lo = int(saber_floor_lo)
+        self.eos_penalty = float(eos_penalty)
+        self.eos_token_id = int(eos_token_id) if eos_token_id is not None else None
+
     @property
     def rank(self):
         return self._rank
@@ -355,8 +421,81 @@ class LLaDAEvalHarness(LM):
             stop_tokens = req.args[1]['until']
             input_ids = batched_input_ids
             step_records = None
-            if self.use_cache:
-                if self.mid_block_expand:
+            if self.saber_dynamic:
+                generated_answer, nfe = generate_with_expand_saber_dynamic(
+                    self.model, input_ids, steps=self.steps,
+                    gen_length=self.gen_length, block_length=self.block_length,
+                    temperature=0, remasking=self.remasking, mask_id=self.mask_id,
+                    mid_trigger_ratio=self.saber_mtr,
+                    global_aadu=self.saber_global_aadu,
+                    berm_mode=self.berm_mode,
+                    n_hi=self.saber_n_hi, n_lo=self.saber_n_lo,
+                    mu_lo=self.saber_mu_lo, mu_hi=self.saber_mu_hi,
+                    gamma_n=self.saber_gamma_n, gamma_mu=self.saber_gamma_mu,
+                    gamma_floor=self.saber_gamma_floor,
+                    remask_ratio_hi=self.saber_remask_ratio_hi,
+                    floor_lo=self.saber_floor_lo,
+                    berm_scope=self.saber_berm_scope,
+                    eos_penalty=self.eos_penalty,
+                    eos_token_id=self.eos_token_id,
+                )
+            elif self.saber_expand:
+                generated_answer, nfe = generate_with_expand_saber(
+                    self.model, input_ids, steps=self.steps,
+                    gen_length=self.gen_length, block_length=self.block_length,
+                    temperature=0, remasking=self.remasking, mask_id=self.mask_id,
+                    mid_trigger_ratio=self.saber_mtr,
+                    saber_n=self.saber_n, saber_mu=self.saber_mu,
+                    berm_mode=self.berm_mode, global_aadu=self.saber_global_aadu,
+                    post_global_berm_rounds=self.saber_post_global_berm_rounds,
+                    post_global_berm_window_mul=self.saber_post_global_berm_window_mul,
+                    fullstage_berm=self.saber_fullstage_berm,
+                    fullstage_berm_on_rewarm=self.saber_fullstage_berm_on_rewarm,
+                    berm_scope=self.saber_berm_scope,
+                )
+            elif self.saber_dual_cache:
+                generated_answer, nfe = generate_with_dual_cache_saber(
+                    self.model, input_ids, steps=self.steps,
+                    gen_length=self.gen_length, block_length=self.block_length,
+                    temperature=0, remasking=self.remasking, mask_id=self.mask_id,
+                    saber_n=self.saber_n, saber_mu=self.saber_mu,
+                    berm_mode=self.berm_mode, global_aadu=self.saber_global_aadu,
+                )
+            elif self.use_cache:
+                if self.streaming_cache and self.mid_block_expand:
+                    _record = (self.step_records_dir is not None)
+                    ret = generate_with_dual_cache_expand(
+                        self.model, input_ids, steps=self.steps,
+                        gen_length=self.gen_length, block_length=self.block_length,
+                        temperature=0, remasking=self.remasking,
+                        mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                        mid_trigger_ratio=self.mid_trigger_ratio,
+                        rewarm_on_expand=self.rewarm_on_expand,
+                        front_block_fallback_only=self.front_block_fallback_only,
+                        hfb=self.hfb,
+                        record_steps=_record,
+                        suffix_mode=self.suffix_mode,
+                        window_blocks=self.window_blocks,
+                        adaptive_alpha=self.adaptive_alpha,
+                        streaming_refine=True,
+                        expand_trigger_mode=self.expand_trigger_mode,
+                        vel_threshold=self.vel_threshold,
+                        conf_threshold=self.conf_threshold,
+                    )
+                    if _record:
+                        generated_answer, nfe, step_records = ret
+                    else:
+                        generated_answer, nfe = ret
+                elif self.streaming_cache:
+                    generated_answer, nfe = generate_with_streaming_cache(
+                        self.model, input_ids, steps=self.steps,
+                        gen_length=self.gen_length, block_length=self.block_length,
+                        temperature=0, remasking=self.remasking,
+                        mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                        window_blocks=self.window_blocks,
+                        adaptive_alpha=self.adaptive_alpha,
+                    )
+                elif self.mid_block_expand:
                     # Mid-block chain expansion variant
                     _record = (self.step_records_dir is not None)
                     ret = generate_with_dual_cache_expand(
@@ -369,6 +508,12 @@ class LLaDAEvalHarness(LM):
                         front_block_fallback_only=self.front_block_fallback_only,
                         hfb=self.hfb,
                         record_steps=_record,
+                        suffix_mode=self.suffix_mode,
+                        window_blocks=self.window_blocks,
+                        adaptive_alpha=self.adaptive_alpha,
+                        expand_trigger_mode=self.expand_trigger_mode,
+                        vel_threshold=self.vel_threshold,
+                        conf_threshold=self.conf_threshold,
                     )
                     if _record:
                         generated_answer, nfe, step_records = ret
@@ -376,7 +521,8 @@ class LLaDAEvalHarness(LM):
                         generated_answer, nfe = ret
                 elif self.dual_cache:
                     generated_answer, nfe = generate_with_dual_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
-                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)
+                                        temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
+                                        suffix_mode=self.suffix_mode, window_blocks=self.window_blocks, adaptive_alpha=self.adaptive_alpha)
                 else:
                     generated_answer, nfe = generate_with_prefix_cache(self.model, input_ids, steps=self.steps, gen_length=self.gen_length, block_length=self.block_length, 
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor)

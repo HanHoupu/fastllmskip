@@ -58,7 +58,14 @@ def _decode(tokenizer, token_id: int) -> str:
         return f"<{token_id}>"
 
 
-def process_sample(sample_blocks: list, tokenizer, batch_idx: int = 0) -> dict:
+def process_sample(
+    sample_blocks: list,
+    tokenizer,
+    batch_idx: int = 0,
+    question: Optional[str] = None,
+    gen_answer: Optional[str] = None,
+    ref_answer: Optional[str] = None,
+) -> dict:
     """
     Convert one sample (list of block dicts) to a JSON-serializable structure.
 
@@ -84,8 +91,10 @@ def process_sample(sample_blocks: list, tokenizer, batch_idx: int = 0) -> dict:
 
     all_steps: List[dict] = []
     for block in sample_blocks:
-        br = list(block["steps"][0]["current_block_range"])
+        default_br = list(block["steps"][0]["current_block_range"])
         for sd in block["steps"]:
+            # Keep per-step window range so expanded windows are rendered correctly.
+            br = list(sd.get("current_block_range", default_br))
             x = sd["x"][batch_idx]
             x0 = sd.get("x0")
             if x0 is not None:
@@ -120,13 +129,20 @@ def process_sample(sample_blocks: list, tokenizer, batch_idx: int = 0) -> dict:
 
             all_steps.append({"s": sd["step"], "br": br, "tk": tokens})
 
-    return {
+    result = {
         "prompt": prompt_text,
         "num_blocks": len(sample_blocks),
         "block_ranges": block_ranges,
         "gen_start": gen_start,
         "steps": all_steps,
     }
+    if question is not None:
+        result["question"] = question
+    if gen_answer is not None:
+        result["gen_answer"] = str(gen_answer)
+    if ref_answer is not None:
+        result["ref_answer"] = str(ref_answer)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +174,10 @@ h1{font-size:22px;margin-bottom:6px}
 .tk.forced{background:#4b5563!important;color:#fff;border:2px solid #374151;font-weight:600}
 .tk.regret-s{background:#d97706!important;color:#451a03;border:2px solid #b45309}
 .tk.regret-d{background:#c026d3!important;color:#4a044e;border:2px solid #a21caf}
+.tk.saber-f4{background:#0ea5e9!important;color:#082f49;border:2px solid #0284c7;font-weight:700}
+.tk.berm-rm{border:2px solid #f43f5e!important;box-shadow:0 0 0 1px #f43f5e inset}
+.tk.saber-f4{background:#0ea5e9!important;color:#082f49;border:2px solid #0284c7;font-weight:700}
+.tk.berm-rm{border:2px solid #f43f5e!important;box-shadow:0 0 0 1px #f43f5e inset}
 .tip{visibility:hidden;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);background:rgba(0,0,0,.92);color:#fff;padding:6px 10px;border-radius:5px;font-size:12px;white-space:nowrap;z-index:999;pointer-events:none}
 .tk:hover .tip{visibility:visible}
 .blk-sep{display:inline-block;width:3px;height:26px;background:linear-gradient(#64ffda,#7c3aed);margin:0 8px;vertical-align:middle;border-radius:2px}
@@ -202,8 +222,12 @@ h1{font-size:22px;margin-bottom:6px}
     <div class="legend-title">Legend</div>
     <div class="legend-row"><div class="legend-swatch" style="background:#233554"></div>Decoded (normal)</div>
     <div class="legend-row"><div class="legend-swatch" style="background:#4b5563;border:2px solid #374151"></div>Forced decode (&lt;0.9)</div>
+    <div class="legend-row"><div class="legend-swatch" style="background:#0ea5e9;border:2px solid #0284c7"></div>Saber floor forced (n)</div>
+    <div class="legend-row"><div class="legend-swatch" style="background:#0ea5e9;border:2px solid #0284c7"></div>Saber floor forced (n)</div>
     <div class="legend-row"><div class="legend-swatch" style="background:#d97706;border:2px solid #b45309"></div>Confidence dropped</div>
     <div class="legend-row"><div class="legend-swatch" style="background:#c026d3;border:2px solid #a21caf"></div>Model changed mind</div>
+    <div class="legend-row"><div class="legend-swatch" style="background:#334155;border:2px solid #f43f5e"></div>BERM remask</div>
+    <div class="legend-row"><div class="legend-swatch" style="background:#334155;border:2px solid #f43f5e"></div>BERM remask</div>
     <div class="legend-row"><div class="legend-swatch" style="background:linear-gradient(90deg,#dc2626,#eab308,#22c55e)"></div>Masked (by confidence)</div>
   </div>
 </div>
@@ -253,15 +277,20 @@ function render(idx){
     const inCur=tk.p>=bs&&tk.p<be;
     let cls='',status='';
     if(decoded&&inCur){
-      if(justDecoded&&tk.c<THRESH){cls='forced';status='Forced';}
+      if(justDecoded&&tk.f4){cls='saber-f4';status='Saber floor forced';}
+      else if(justDecoded&&tk.c<THRESH){cls='forced';status='Forced';}
       else if(!justDecoded&&tk.x!==null){
         if(tk.x!==tk.d){cls='regret-d';status='Regret (diff)';}
         else if(tk.c<THRESH){cls='regret-s';status='Regret (conf)';}
       }
     }
+    const justRemasked = pt && !pt.m && tk.m;
     if(cls){sp.classList.add(cls);}
     else if(decoded){sp.classList.add('decoded');status='Decoded';out+=tk.t;}
-    else{sp.classList.add('masked');sp.style.background=confColor(tk.c);status='Masked';out+=' ';}
+    else{
+      sp.classList.add('masked');sp.style.background=confColor(tk.c);status='Masked';out+=' ';
+      if(justRemasked||tk.brm){sp.classList.add('berm-rm');status='BERM remask';}
+    }
     if(cls)out+=tk.t;
     sp.textContent=tk.m?`[${tk.t}]`:tk.t;
     const tip=document.createElement('span');tip.className='tip';
@@ -294,6 +323,192 @@ def generate_html(sample_json: dict, title: str = "Denoising Visualization") -> 
     """Embed processed sample data into the HTML template."""
     data_str = json.dumps(sample_json, ensure_ascii=False, separators=(",", ":"))
     html = _HTML_TEMPLATE.replace("__DATA_JSON__", data_str).replace("__TITLE__", title)
+    return html
+
+
+# ---------------------------------------------------------------------------
+# Multi-sample HTML (all samples in one file, with sample navigation)
+# ---------------------------------------------------------------------------
+
+_MULTI_HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__TITLE__</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#1a1a2e;color:#eee;display:flex;min-height:100vh}
+.main{flex:1;margin-right:280px;padding:20px;overflow-y:auto}
+.sidebar{position:fixed;right:0;top:0;width:270px;height:100vh;background:#16213e;padding:18px;overflow-y:auto;box-shadow:-2px 0 12px rgba(0,0,0,.4)}
+h1{font-size:22px;margin-bottom:6px}
+.meta{color:#8892b0;font-size:13px;margin-bottom:18px}
+.section{margin-bottom:22px}
+.section-title{font-size:15px;font-weight:600;color:#ccd6f6;margin-bottom:8px;border-bottom:1px solid #233554;padding-bottom:4px}
+.prompt-box{background:#0a192f;padding:14px;border-radius:6px;border-left:3px solid #64ffda;font-family:'Courier New',monospace;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;color:#a8b2d1}
+.tokens-wrap{background:#0a192f;padding:14px;border-radius:6px;line-height:2.1;font-family:'Courier New',monospace;font-size:14px;word-wrap:break-word;white-space:pre-wrap}
+.output-box{background:#0a192f;padding:14px;border-radius:6px;font-family:'Courier New',monospace;font-size:13px;white-space:pre-wrap;word-break:break-all;max-height:280px;overflow-y:auto;color:#a8b2d1;line-height:1.6}
+.tk{display:inline-block;padding:3px 5px;margin:2px;border-radius:4px;cursor:default;position:relative;transition:transform .15s}
+.tk:hover{transform:translateY(-2px);box-shadow:0 4px 10px rgba(0,0,0,.4);z-index:99}
+.tk.masked{border:2px dashed #546e7a}
+.tk.decoded{background:#233554!important;color:#8892b0}
+.tk.forced{background:#4b5563!important;color:#fff;border:2px solid #374151;font-weight:600}
+.tk.regret-s{background:#d97706!important;color:#451a03;border:2px solid #b45309}
+.tk.regret-d{background:#c026d3!important;color:#4a044e;border:2px solid #a21caf}
+.tip{visibility:hidden;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);background:rgba(0,0,0,.92);color:#fff;padding:6px 10px;border-radius:5px;font-size:12px;white-space:nowrap;z-index:999;pointer-events:none}
+.tk:hover .tip{visibility:visible}
+.blk-sep{display:inline-block;width:3px;height:26px;background:linear-gradient(#64ffda,#7c3aed);margin:0 8px;vertical-align:middle;border-radius:2px}
+.blk-label{display:inline-block;background:linear-gradient(135deg,#7c3aed,#4f46e5);color:#fff;padding:2px 10px;border-radius:10px;font-size:12px;font-weight:600;margin:3px 6px}
+/* sidebar controls */
+.step-info{text-align:center;font-size:15px;font-weight:600;padding:8px;background:#0a192f;border-radius:6px;margin-bottom:12px}
+.slider{width:100%;margin:8px 0;-webkit-appearance:none;height:6px;border-radius:3px;background:#233554;outline:none}
+.slider::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#64ffda;cursor:pointer}
+.btns{display:flex;gap:6px;margin-bottom:10px}
+.btns button{flex:1;padding:8px;border:none;border-radius:5px;font-size:14px;cursor:pointer;font-weight:500;transition:background .2s}
+.btn-prev,.btn-next{background:#233554;color:#ccd6f6}
+.btn-prev:hover,.btn-next:hover{background:#2d4a6f}
+.btn-play{background:#064e3b;color:#6ee7b7}
+.btn-play.on{background:#7f1d1d;color:#fca5a5}
+.btn-speed{background:#233554;color:#e2e8f0}
+.sample-nav{margin-bottom:16px;padding:10px;background:#0a192f;border-radius:6px}
+.sample-nav select{width:100%;padding:6px;border-radius:4px;border:1px solid #233554;background:#16213e;color:#ccd6f6;font-size:13px}
+.sample-nav .nav-btns{display:flex;gap:6px;margin-top:8px}
+.sample-nav .nav-btns button{flex:1;padding:6px;border:none;border-radius:4px;font-size:13px;cursor:pointer;background:#233554;color:#ccd6f6}
+.sample-nav .nav-btns button:hover{background:#2d4a6f}
+.answer-box{background:#0a192f;padding:10px;border-radius:6px;font-size:13px;margin-bottom:12px;border-left:3px solid #7c3aed;color:#a8b2d1}
+.answer-box .correct{color:#22c55e;font-weight:600}
+.answer-box .wrong{color:#ef4444;font-weight:600}
+.legend{margin-top:16px;font-size:12px;color:#8892b0}
+.legend-title{font-weight:600;color:#ccd6f6;margin-bottom:6px}
+.legend-row{display:flex;align-items:center;gap:8px;margin-bottom:5px}
+.legend-swatch{width:32px;height:16px;border-radius:3px;flex-shrink:0}
+</style>
+</head>
+<body>
+<div class="main">
+  <h1>__TITLE__</h1>
+  <p class="meta" id="metaInfo"></p>
+  <div class="section" id="questionSection" style="display:none"><div class="section-title">Question</div><div class="prompt-box" id="questionBox"></div></div>
+  <div class="section"><div class="section-title">Prompt</div><div class="prompt-box" id="promptBox"></div></div>
+  <div class="section"><div class="section-title">Token Visualization</div><div class="tokens-wrap" id="tokensDisplay"></div></div>
+  <div class="section"><div class="section-title">Text Output</div><div class="output-box" id="outputBox"></div></div>
+</div>
+<div class="sidebar">
+  <div class="sample-nav">
+    <div style="font-weight:600;margin-bottom:6px;color:#ccd6f6">Sample</div>
+    <select id="sampleSelect"></select>
+    <div class="nav-btns">
+      <button id="prevSample">&#9664; Prev Sample</button>
+      <button id="nextSample">Next Sample &#9654;</button>
+    </div>
+  </div>
+  <div class="answer-box" id="answerBox" style="display:none"></div>
+  <div class="step-info" id="stepInfo">Loading...</div>
+  <input type="range" class="slider" id="slider" min="0" max="0" value="0">
+  <div class="btns">
+    <button class="btn-prev" id="prevBtn">&#9664; Prev</button>
+    <button class="btn-play" id="playBtn">&#9654; Play</button>
+    <button class="btn-next" id="nextBtn">Next &#9654;</button>
+  </div>
+  <div class="btns">
+    <button class="btn-speed" id="speedBtn">Speed: 1x</button>
+  </div>
+  <div class="legend">
+    <div class="legend-title">Legend</div>
+    <div class="legend-row"><div class="legend-swatch" style="background:#233554"></div>Decoded (normal)</div>
+    <div class="legend-row"><div class="legend-swatch" style="background:#4b5563;border:2px solid #374151"></div>Forced decode (&lt;0.9)</div>
+    <div class="legend-row"><div class="legend-swatch" style="background:#d97706;border:2px solid #b45309"></div>Confidence dropped</div>
+    <div class="legend-row"><div class="legend-swatch" style="background:#c026d3;border:2px solid #a21caf"></div>Model changed mind</div>
+    <div class="legend-row"><div class="legend-swatch" style="background:linear-gradient(90deg,#dc2626,#eab308,#22c55e)"></div>Masked (by confidence)</div>
+  </div>
+</div>
+<script>
+const SAMPLES=__SAMPLES_JSON__;
+let sIdx=0;
+const sel=document.getElementById('sampleSelect');
+SAMPLES.forEach((s,i)=>{const o=document.createElement('option');o.value=i;const tag=s.gen_answer?(s.gen_answer.includes('\u2713')?'\u2713':'\u2717'):'';o.textContent=`#${i} ${tag} (${s.steps.length} steps)`;sel.appendChild(o);});
+
+function loadSample(si){
+  sIdx=si;sel.value=si;
+  const D=SAMPLES[si];
+  window._D=D;window._BR=D.block_ranges;
+  document.getElementById('promptBox').textContent=D.prompt;
+  document.getElementById('metaInfo').textContent=`Sample ${si+1}/${SAMPLES.length} | ${D.num_blocks} blocks | ${D.steps.length} steps | gen_start=${D.gen_start}`;
+  const qSec=document.getElementById('questionSection');
+  if(D.question){qSec.style.display='';document.getElementById('questionBox').textContent=D.question;}else{qSec.style.display='none';}
+  const aBox=document.getElementById('answerBox');
+  if(D.gen_answer){aBox.style.display='';const isC=D.gen_answer.includes('\u2713');aBox.innerHTML=`<span class="${isC?'correct':'wrong'}">Answer: ${D.gen_answer}</span>`+(D.ref_answer?`<br>Ref: ${D.ref_answer}`:'');}else{aBox.style.display='none';}
+  const slider=document.getElementById('slider');
+  slider.max=D.steps.length-1;slider.value=0;
+  render(0);
+}
+
+function blockOf(p){const BR=window._BR;for(let i=0;i<BR.length;i++){if(p>=BR[i][0]&&p<BR[i][1])return i;}return BR.length-1;}
+function confColor(c){let r,g,b;if(c<0.5){const t=c/0.5;r=220+(234-220)*t;g=38+(179-38)*t;b=38+(8-38)*t;}else{const t=(c-0.5)/0.5;r=234+(34-234)*t;g=179+(197-179)*t;b=8+(94-8)*t;}return`rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`;}
+
+let cur=0,playing=false,timer=null;
+const speeds=[0.5,1,2,4,8];let si=1;
+
+function render(idx){
+  const D=window._D;cur=idx;document.getElementById('slider').value=idx;
+  const st=D.steps[idx];const[bs,be]=st.br;
+  document.getElementById('stepInfo').textContent=`Block ${blockOf(bs)} | Step ${idx+1}/${D.steps.length}`;
+  const prev=idx>0?D.steps[idx-1]:null;
+  const pm=new Map();if(prev)prev.tk.forEach(t=>pm.set(t.p,t));
+  const container=document.getElementById('tokensDisplay');
+  const outBox=document.getElementById('outputBox');
+  container.innerHTML='';let out='';let lastBlk=-1;const THRESH=0.9;
+  st.tk.forEach(tk=>{
+    const blk=blockOf(tk.p);
+    if(blk!==lastBlk){if(lastBlk!==-1){const sep=document.createElement('span');sep.className='blk-sep';container.appendChild(sep);out+=' | ';}const lb=document.createElement('span');lb.className='blk-label';lb.textContent='B'+blk;container.appendChild(lb);lastBlk=blk;}
+    const sp=document.createElement('span');sp.className='tk';
+    const decoded=!tk.m;const pt=pm.get(tk.p);const justDecoded=pt&&pt.m&&decoded;const inCur=tk.p>=bs&&tk.p<be;
+    let cls='',status='';
+    if(decoded&&inCur){if(justDecoded&&tk.f4){cls='saber-f4';status='Saber floor forced';}else if(justDecoded&&tk.c<THRESH){cls='forced';status='Forced';}else if(!justDecoded&&tk.x!==null){if(tk.x!==tk.d){cls='regret-d';status='Regret (diff)';}else if(tk.c<THRESH){cls='regret-s';status='Regret (conf)';}}}
+    const justRemasked = pt && !pt.m && tk.m;
+    if(cls){sp.classList.add(cls);}else if(decoded){sp.classList.add('decoded');status='Decoded';out+=tk.t;}else{sp.classList.add('masked');sp.style.background=confColor(tk.c);status='Masked';out+=' ';if(justRemasked||tk.brm){sp.classList.add('berm-rm');status='BERM remask';}}
+    if(cls)out+=tk.t;
+    sp.textContent=tk.m?`[${tk.t}]`:tk.t;
+    const tip=document.createElement('span');tip.className='tip';
+    let tipTxt=`Pos:${tk.p} | Conf:${tk.c.toFixed(4)} | ${status}`;
+    if(cls==='regret-d'&&tk.xt)tipTxt+=` \u2192 wants "${tk.xt}"`;
+    tip.textContent=tipTxt;sp.appendChild(tip);container.appendChild(sp);
+  });
+  outBox.textContent=out;
+}
+
+sel.addEventListener('change',e=>loadSample(+e.target.value));
+document.getElementById('prevSample').addEventListener('click',()=>{if(sIdx>0)loadSample(sIdx-1);});
+document.getElementById('nextSample').addEventListener('click',()=>{if(sIdx<SAMPLES.length-1)loadSample(sIdx+1);});
+document.getElementById('slider').addEventListener('input',e=>render(+e.target.value));
+document.getElementById('prevBtn').addEventListener('click',()=>{if(cur>0)render(cur-1);});
+document.getElementById('nextBtn').addEventListener('click',()=>{if(cur<window._D.steps.length-1)render(cur+1);});
+document.getElementById('playBtn').addEventListener('click',()=>{playing=!playing;const b=document.getElementById('playBtn');if(playing){b.textContent='\u23f8 Pause';b.classList.add('on');play();}else{b.textContent='\u25b6 Play';b.classList.remove('on');clearInterval(timer);}});
+function play(){timer=setInterval(()=>{if(cur<window._D.steps.length-1)render(cur+1);else{playing=false;document.getElementById('playBtn').textContent='\u25b6 Play';document.getElementById('playBtn').classList.remove('on');clearInterval(timer);}},500/speeds[si]);}
+document.getElementById('speedBtn').addEventListener('click',()=>{si=(si+1)%speeds.length;document.getElementById('speedBtn').textContent='Speed: '+speeds[si]+'x';if(playing){clearInterval(timer);play();}});
+document.addEventListener('keydown',e=>{if(e.key==='ArrowLeft'&&cur>0)render(cur-1);if(e.key==='ArrowRight'&&cur<window._D.steps.length-1)render(cur+1);if(e.key===' '){e.preventDefault();document.getElementById('playBtn').click();}});
+loadSample(0);
+</script>
+</body>
+</html>"""
+
+
+def generate_multi_html(
+    samples_json: List[dict],
+    title: str = "Denoising Visualization",
+) -> str:
+    """
+    Generate a single HTML file containing all samples with a sample navigator.
+
+    Args:
+        samples_json: List of dicts from process_sample().
+        title: Page title.
+
+    Returns:
+        HTML string.
+    """
+    data_str = json.dumps(samples_json, ensure_ascii=False, separators=(",", ":"))
+    html = _MULTI_HTML_TEMPLATE.replace("__SAMPLES_JSON__", data_str).replace("__TITLE__", title)
     return html
 
 
